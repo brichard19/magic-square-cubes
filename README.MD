@@ -144,7 +144,8 @@ The HIP backend performs these stages for every partition:
 
 1. The CPU calculates each valid `[a, b0..bN]` span and its exact prefix-sum
    output offset.
-2. One GPU thread block generates the pairs for each span.
+2. One GPU thread block generates the pairs for each span. Its thread count is
+   set to the active GPU's reported wavefront size.
 3. The pair buffer is padded to the next power of two and bitonic-sorted by its
    128-bit sum.
 4. GPU kernels count and compact equal-sum pair combinations.

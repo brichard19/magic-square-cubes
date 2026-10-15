@@ -11,8 +11,6 @@
 
 namespace {
 
-constexpr unsigned int threads_per_block = 32;
-
 struct gpu_pair_record {
     u64 s_low;
     u64 s_high;
@@ -47,6 +45,30 @@ static void check_hip(
     throw std::runtime_error(
         std::string(operation) + ": " +
         hipGetErrorString(result));
+}
+
+static unsigned int active_device_wavefront_size()
+{
+    int device = 0;
+    check_hip(
+        hipGetDevice(&device),
+        "get active HIP device");
+
+    hipDeviceProp_t properties{};
+    check_hip(
+        hipGetDeviceProperties(&properties, device),
+        "get HIP device properties");
+
+    if (properties.warpSize <= 0 ||
+        properties.warpSize >
+            properties.maxThreadsPerBlock)
+    {
+        throw std::runtime_error(
+            "HIP device reported an invalid wavefront size");
+    }
+
+    return static_cast<unsigned int>(
+        properties.warpSize);
 }
 
 template <typename T>
@@ -286,7 +308,9 @@ static u64 next_power_of_two(u64 value)
     return result;
 }
 
-static dim3 one_dimensional_grid(u64 item_count)
+static dim3 one_dimensional_grid(
+    u64 item_count,
+    unsigned int threads_per_block)
 {
     const u64 block_count =
         (item_count + threads_per_block - 1) /
@@ -534,6 +558,9 @@ std::vector<collision_record> search_partition_collisions_gpu(
             "a and b values must fit in uint32_t");
     }
 
+    const unsigned int threads_per_block =
+        active_device_wavefront_size();
+
     const auto spans = make_pair_spans(partition);
 
     if (spans.empty())
@@ -585,7 +612,9 @@ std::vector<collision_record> search_partition_collisions_gpu(
         "launch pair-generation kernel");
 
     const dim3 sort_grid =
-        one_dimensional_grid(padded_pair_count);
+        one_dimensional_grid(
+            padded_pair_count,
+            threads_per_block);
 
     for (u64 sequence_length = 2;
          sequence_length <= padded_pair_count;
@@ -626,7 +655,9 @@ std::vector<collision_record> search_partition_collisions_gpu(
         "initialize GPU collision counter");
 
     const dim3 pair_grid =
-        one_dimensional_grid(partition.pair_count);
+        one_dimensional_grid(
+            partition.pair_count,
+            threads_per_block);
 
     hipLaunchKernelGGL(
         count_collisions_kernel,
