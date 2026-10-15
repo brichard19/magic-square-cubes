@@ -146,15 +146,21 @@ The HIP backend performs these stages for every partition:
    output offset.
 2. One GPU thread block generates the pairs for each span. Its thread count is
    set to the active GPU's reported wavefront size.
-3. The pair buffer is padded to the next power of two and bitonic-sorted by its
-   128-bit sum.
+3. rocPRIM performs a stable device-wide radix sort using the unsigned 128-bit
+   sums as keys and the separate `a` and `b` arrays as values.
 4. GPU kernels count and compact equal-sum pair combinations.
 5. Compact collision inputs are copied to the CPU, where their GCD-based
    signatures are calculated.
 
-Power-of-two padding means the GPU pair allocation can approach twice the
-un-padded pair-buffer size. Additional space is required for span and collision
-buffers.
+GPU pair data uses a structure-of-arrays layout: sums are stored as contiguous
+unsigned 128-bit values, with separate contiguous `uint32_t` arrays for `a` and
+`b`. This keeps each field naturally aligned and allows adjacent GPU threads to
+issue coalesced accesses.
+
+Radix sorting does not require power-of-two padding. It does require a second
+set of sum, `a`, and `b` arrays for its output, plus rocPRIM temporary storage.
+The GPU therefore needs at least twice the target pair-buffer space, along with
+additional space for radix-sort workspace, spans, and collisions.
 
 ## Progress output
 
@@ -166,6 +172,8 @@ At startup, the program reports:
 - Every generated partition
 - Bucket configuration and output directory
 - Active worker count
+- GPU grid and block sizes for generation and collision scanning, plus the
+  rocPRIM radix-sort item count and temporary-storage requirement
 
 After each partition, it reports the collision count, elapsed search time, and
 throughput in `Mops/sec`. One operation means one `(a,b)` pair processed. The

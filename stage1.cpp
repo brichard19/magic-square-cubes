@@ -1141,8 +1141,8 @@ int main(int argc, char* argv[])
 
     if (use_gpu) {
         std::printf(
-            "GPU sorting: bitonic; each partition is padded "
-            "to the next power-of-two pair count\n");
+            "GPU sorting: device-wide radix sort of "
+            "unsigned 128-bit sums\n");
     }
 
     std::fflush(stdout);

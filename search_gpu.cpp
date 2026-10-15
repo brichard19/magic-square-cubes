@@ -1,9 +1,12 @@
 #include "search_gpu.h"
 
 #include <hip/hip_runtime.h>
+#include <rocprim/device/device_radix_sort.hpp>
+#include <rocprim/iterator/zip_iterator.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -11,12 +14,8 @@
 
 namespace {
 
-struct gpu_pair_record {
-    u64 s_low;
-    u64 s_high;
-    u32 a;
-    u32 b;
-};
+constexpr std::size_t gpu_pair_storage_size =
+    sizeof(u128) + 2 * sizeof(u32);
 
 struct gpu_pair_span {
     u32 a;
@@ -32,7 +31,7 @@ struct gpu_collision_input {
     u32 b2;
 };
 
-static_assert(sizeof(gpu_pair_record) == 24);
+static_assert(gpu_pair_storage_size == 24);
 static_assert(sizeof(gpu_collision_input) == 16);
 
 static void check_hip(
@@ -290,24 +289,6 @@ static std::vector<gpu_pair_span> make_pair_spans(
     return spans;
 }
 
-static u64 next_power_of_two(u64 value)
-{
-    u64 result = 1;
-
-    while (result < value) {
-        if (result >
-            std::numeric_limits<u64>::max() / 2)
-        {
-            throw std::overflow_error(
-                "bitonic sort size overflow");
-        }
-
-        result *= 2;
-    }
-
-    return result;
-}
-
 static dim3 one_dimensional_grid(
     u64 item_count,
     unsigned int threads_per_block)
@@ -331,49 +312,18 @@ __device__ u128 cube_gpu(u32 x)
     return u128(x) * x * x;
 }
 
-__device__ gpu_pair_record add_cubes_gpu(
+__device__ u128 add_cubes_gpu(
     u32 a,
     u32 b)
 {
-    const u128 sum =
-        cube_gpu(a) + cube_gpu(b);
-
-    return {
-        static_cast<u64>(sum),
-        static_cast<u64>(sum >> 64),
-        a,
-        b
-    };
-}
-
-__device__ bool sums_equal(
-    const gpu_pair_record& left,
-    const gpu_pair_record& right)
-{
-    return
-        left.s_high == right.s_high &&
-        left.s_low == right.s_low;
-}
-
-__device__ bool pair_less(
-    const gpu_pair_record& left,
-    const gpu_pair_record& right)
-{
-    if (left.s_high != right.s_high)
-        return left.s_high < right.s_high;
-
-    if (left.s_low != right.s_low)
-        return left.s_low < right.s_low;
-
-    if (left.a != right.a)
-        return left.a < right.a;
-
-    return left.b < right.b;
+    return cube_gpu(a) + cube_gpu(b);
 }
 
 __global__ void generate_pairs_kernel(
     const gpu_pair_span* spans,
-    gpu_pair_record* pairs)
+    u128* sums,
+    u32* a_values,
+    u32* b_values)
 {
     const gpu_pair_span span = spans[blockIdx.x];
     const u64 pair_count =
@@ -387,47 +337,18 @@ __global__ void generate_pairs_kernel(
             span.min_b +
             static_cast<u32>(local_index);
 
-        pairs[span.output_offset + local_index] =
+        const u64 output_index =
+            span.output_offset + local_index;
+
+        sums[output_index] =
             add_cubes_gpu(span.a, b);
-    }
-}
-
-__global__ void bitonic_sort_step_kernel(
-    gpu_pair_record* pairs,
-    u64 pair_count,
-    u64 sequence_length,
-    u64 comparison_stride)
-{
-    const u64 index =
-        u64(blockIdx.x) * blockDim.x +
-        threadIdx.x;
-
-    if (index >= pair_count)
-        return;
-
-    const u64 partner = index ^ comparison_stride;
-
-    if (partner <= index || partner >= pair_count)
-        return;
-
-    const bool ascending =
-        (index & sequence_length) == 0;
-
-    const gpu_pair_record left = pairs[index];
-    const gpu_pair_record right = pairs[partner];
-
-    const bool swap = ascending
-        ? pair_less(right, left)
-        : pair_less(left, right);
-
-    if (swap) {
-        pairs[index] = right;
-        pairs[partner] = left;
+        a_values[output_index] = span.a;
+        b_values[output_index] = b;
     }
 }
 
 __global__ void count_collisions_kernel(
-    const gpu_pair_record* pairs,
+    const u128* sums,
     u64 pair_count,
     unsigned long long* collision_count)
 {
@@ -439,7 +360,7 @@ __global__ void count_collisions_kernel(
         return;
 
     if (index > 0 &&
-        sums_equal(pairs[index - 1], pairs[index]))
+        sums[index - 1] == sums[index])
     {
         return;
     }
@@ -447,7 +368,7 @@ __global__ void count_collisions_kernel(
     u64 end = index + 1;
 
     while (end < pair_count &&
-           sums_equal(pairs[index], pairs[end]))
+           sums[index] == sums[end])
     {
         ++end;
     }
@@ -466,7 +387,9 @@ __global__ void count_collisions_kernel(
 }
 
 __global__ void collect_collisions_kernel(
-    const gpu_pair_record* pairs,
+    const u128* sums,
+    const u32* a_values,
+    const u32* b_values,
     u64 pair_count,
     gpu_collision_input* collisions,
     unsigned long long* next_collision)
@@ -479,7 +402,7 @@ __global__ void collect_collisions_kernel(
         return;
 
     if (index > 0 &&
-        sums_equal(pairs[index - 1], pairs[index]))
+        sums[index - 1] == sums[index])
     {
         return;
     }
@@ -487,7 +410,7 @@ __global__ void collect_collisions_kernel(
     u64 end = index + 1;
 
     while (end < pair_count &&
-           sums_equal(pairs[index], pairs[end]))
+           sums[index] == sums[end])
     {
         ++end;
     }
@@ -512,10 +435,10 @@ __global__ void collect_collisions_kernel(
              ++second)
         {
             collisions[output_index++] = {
-                pairs[first].a,
-                pairs[first].b,
-                pairs[second].a,
-                pairs[second].b
+                a_values[first],
+                b_values[first],
+                a_values[second],
+                b_values[second]
             };
         }
     }
@@ -525,14 +448,14 @@ __global__ void collect_collisions_kernel(
 
 std::size_t gpu_pair_record_size() noexcept
 {
-    return sizeof(gpu_pair_record);
+    return gpu_pair_storage_size;
 }
 
 u64 gpu_pair_record_max_count() noexcept
 {
     return static_cast<u64>(
         std::numeric_limits<std::size_t>::max() /
-        sizeof(gpu_pair_record));
+        gpu_pair_storage_size);
 }
 
 std::vector<collision_record> search_partition_collisions_gpu(
@@ -573,13 +496,84 @@ std::vector<collision_record> search_partition_collisions_gpu(
             "GPU partition has too many a spans");
     }
 
-    const u64 padded_pair_count =
-        next_power_of_two(partition.pair_count);
+    if (partition.pair_count >
+        std::numeric_limits<std::size_t>::max())
+    {
+        throw std::length_error(
+            "GPU partition exceeds the host size_t range");
+    }
+
+    const std::size_t pair_count =
+        static_cast<std::size_t>(
+            partition.pair_count);
+
+    const dim3 generation_grid(
+        static_cast<unsigned int>(spans.size()));
+    const dim3 collision_grid =
+        one_dimensional_grid(
+            partition.pair_count,
+            threads_per_block);
 
     device_buffer<gpu_pair_span> device_spans(
         static_cast<u64>(spans.size()));
-    device_buffer<gpu_pair_record> device_pairs(
-        padded_pair_count);
+    device_buffer<u128> device_sums(partition.pair_count);
+    device_buffer<u32> device_a_values(partition.pair_count);
+    device_buffer<u32> device_b_values(partition.pair_count);
+
+    device_buffer<u128> device_sorted_sums(
+        partition.pair_count);
+    device_buffer<u32> device_sorted_a_values(
+        partition.pair_count);
+    device_buffer<u32> device_sorted_b_values(
+        partition.pair_count);
+
+    const auto input_values =
+        rocprim::make_zip_iterator(
+            rocprim::make_tuple(
+                device_a_values.get(),
+                device_b_values.get()));
+
+    const auto output_values =
+        rocprim::make_zip_iterator(
+            rocprim::make_tuple(
+                device_sorted_a_values.get(),
+                device_sorted_b_values.get()));
+
+    std::size_t radix_temporary_storage_size = 0;
+
+    check_hip(
+        rocprim::radix_sort_pairs(
+            nullptr,
+            radix_temporary_storage_size,
+            device_sums.get(),
+            device_sorted_sums.get(),
+            input_values,
+            output_values,
+            pair_count,
+            0,
+            8 * sizeof(u128)),
+        "query rocPRIM radix-sort storage");
+
+    device_buffer<unsigned char> radix_temporary_storage(
+        static_cast<u64>(
+            std::max<std::size_t>(
+                radix_temporary_storage_size,
+                1)));
+
+    std::printf(
+        "GPU pair generation: grid=%u blocks, "
+        "block=%u threads\n"
+        "GPU radix sort: rocPRIM-managed geometry, "
+        "pairs=%llu, temporary_storage=%zu bytes\n"
+        "GPU collision scan: grid=%u blocks, "
+        "block=%u threads\n",
+        generation_grid.x,
+        threads_per_block,
+        (unsigned long long)partition.pair_count,
+        radix_temporary_storage_size,
+        collision_grid.x,
+        threads_per_block);
+    std::fflush(stdout);
 
     check_hip(
         hipMemcpy(
@@ -589,60 +583,32 @@ std::vector<collision_record> search_partition_collisions_gpu(
             hipMemcpyHostToDevice),
         "copy pair spans to GPU");
 
-    // All-ones is a sentinel larger than every valid sum and
-    // therefore sorts after the real pair records.
-    check_hip(
-        hipMemset(
-            device_pairs.get(),
-            0xff,
-            static_cast<std::size_t>(padded_pair_count) *
-                sizeof(gpu_pair_record)),
-        "initialize padded GPU pair buffer");
-
     hipLaunchKernelGGL(
         generate_pairs_kernel,
-        dim3(static_cast<unsigned int>(spans.size())),
+        generation_grid,
         dim3(threads_per_block),
         0,
         0,
         device_spans.get(),
-        device_pairs.get());
+        device_sums.get(),
+        device_a_values.get(),
+        device_b_values.get());
     check_hip(
         hipGetLastError(),
         "launch pair-generation kernel");
 
-    const dim3 sort_grid =
-        one_dimensional_grid(
-            padded_pair_count,
-            threads_per_block);
-
-    for (u64 sequence_length = 2;
-         sequence_length <= padded_pair_count;
-         sequence_length *= 2)
-    {
-        for (u64 comparison_stride =
-                 sequence_length / 2;
-             comparison_stride > 0;
-             comparison_stride /= 2)
-        {
-            hipLaunchKernelGGL(
-                bitonic_sort_step_kernel,
-                sort_grid,
-                dim3(threads_per_block),
-                0,
-                0,
-                device_pairs.get(),
-                padded_pair_count,
-                sequence_length,
-                comparison_stride);
-            check_hip(
-                hipGetLastError(),
-                "launch bitonic-sort kernel");
-        }
-
-        if (sequence_length == padded_pair_count)
-            break;
-    }
+    check_hip(
+        rocprim::radix_sort_pairs(
+            radix_temporary_storage.get(),
+            radix_temporary_storage_size,
+            device_sums.get(),
+            device_sorted_sums.get(),
+            input_values,
+            output_values,
+            pair_count,
+            0,
+            8 * sizeof(u128)),
+        "run rocPRIM radix sort");
 
     device_buffer<unsigned long long>
         device_collision_count(1);
@@ -654,18 +620,13 @@ std::vector<collision_record> search_partition_collisions_gpu(
             sizeof(unsigned long long)),
         "initialize GPU collision counter");
 
-    const dim3 pair_grid =
-        one_dimensional_grid(
-            partition.pair_count,
-            threads_per_block);
-
     hipLaunchKernelGGL(
         count_collisions_kernel,
-        pair_grid,
+        collision_grid,
         dim3(threads_per_block),
         0,
         0,
-        device_pairs.get(),
+        device_sorted_sums.get(),
         partition.pair_count,
         device_collision_count.get());
     check_hip(
@@ -704,11 +665,13 @@ std::vector<collision_record> search_partition_collisions_gpu(
 
     hipLaunchKernelGGL(
         collect_collisions_kernel,
-        pair_grid,
+        collision_grid,
         dim3(threads_per_block),
         0,
         0,
-        device_pairs.get(),
+        device_sorted_sums.get(),
+        device_sorted_a_values.get(),
+        device_sorted_b_values.get(),
         partition.pair_count,
         device_collisions.get(),
         device_collision_count.get());
