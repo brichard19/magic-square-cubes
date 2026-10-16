@@ -167,16 +167,42 @@ static bool parse_thread_count(
     return true;
 }
 
+static bool parse_hip_device(
+    std::string_view text,
+    int& device)
+{
+    if (text.empty())
+        return false;
+
+    u64 value = 0;
+    const char* const begin = text.data();
+    const char* const end = begin + text.size();
+    const auto result =
+        std::from_chars(begin, end, value);
+
+    if (result.ec != std::errc{} ||
+        result.ptr != end ||
+        value > static_cast<u64>(
+            std::numeric_limits<int>::max()))
+    {
+        return false;
+    }
+
+    device = static_cast<int>(value);
+    return true;
+}
+
 static void print_usage(const char* program)
 {
     std::fprintf(
         stderr,
-        "Usage: %s [-a MIN:MAX] [-b MIN:MAX] [-m SIZE] [-j N] "
+        "Usage: %s [-a MIN:MAX] [-b MIN:MAX] [-m SIZE] [-j N] [-d N] "
         "[--backend cpu|gpu]\n"
         "  -m, --buffer-size SIZE  target pair buffer size; B, KB, MB, GB use powers of 1024\n"
         "  -j, --threads N         worker threads; pair buffer applies to each worker\n"
+        "  -d, --hip-device N      HIP device index for the GPU backend\n"
         "      --backend TYPE      search backend: cpu or gpu\n"
-        "Defaults: -a 1:100000 -b 2:100000 -m 1GB -j 1 --backend cpu\n",
+        "Defaults: -a 1:100000 -b 2:100000 -m 1GB -j 1 -d 0 --backend cpu\n",
         program);
 }
 
@@ -936,6 +962,7 @@ int main(int argc, char* argv[])
     u64 max_b = 100000;
     u64 buffer_size_bytes = u64(1) << 30;
     std::size_t requested_thread_count = 1;
+    int requested_hip_device = 0;
     bool use_gpu = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -960,10 +987,15 @@ int main(int argc, char* argv[])
         const bool is_backend_option =
             option == "--backend";
 
+        const bool is_hip_device_option =
+            option == "-d" ||
+            option == "--hip-device";
+
         if (!is_range_option &&
             !is_buffer_option &&
             !is_thread_option &&
-            !is_backend_option)
+            !is_backend_option &&
+            !is_hip_device_option)
         {
             std::fprintf(
                 stderr,
@@ -1037,6 +1069,22 @@ int main(int argc, char* argv[])
             continue;
         }
 
+        if (is_hip_device_option) {
+            if (!parse_hip_device(
+                    value,
+                    requested_hip_device))
+            {
+                std::fprintf(
+                    stderr,
+                    "Invalid HIP device index: %s\n",
+                    value);
+                print_usage(argv[0]);
+                return 1;
+            }
+
+            continue;
+        }
+
         u64& minimum = option == "-a" ? min_a : min_b;
         u64& maximum = option == "-a" ? max_a : max_b;
 
@@ -1074,7 +1122,8 @@ int main(int argc, char* argv[])
     }
 
     const char* backend_name = "CPU";
-    const char* backend_directory = "CPU";
+    std::string backend_directory = "CPU";
+    std::string device_identifier;
     partition_search_function* search_backend_function =
         search_partition_collisions_cpu;
     std::size_t pair_record_size =
@@ -1085,12 +1134,28 @@ int main(int argc, char* argv[])
     if (use_gpu) {
 #ifdef MAGIC_SQUARE_CUBES_ENABLE_HIP
         backend_name = "HIP GPU";
-        backend_directory = "GPU";
         search_backend_function =
             search_partition_collisions_gpu;
         pair_record_size = gpu_pair_record_size();
         pair_record_max_count =
             gpu_pair_record_max_count();
+
+        try {
+            set_hip_device(requested_hip_device);
+            device_identifier =
+                hip_device_identifier(
+                    requested_hip_device);
+            backend_directory =
+                "GPU-" + device_identifier;
+        }
+        catch (const std::exception& error) {
+            std::fprintf(
+                stderr,
+                "Unable to configure HIP device %d: %s\n",
+                requested_hip_device,
+                error.what());
+            return 1;
+        }
 #else
         std::fprintf(
             stderr,
@@ -1125,6 +1190,13 @@ int main(int argc, char* argv[])
     std::printf(
         "Search backend: %s\n",
         backend_name);
+
+    if (use_gpu) {
+        std::printf(
+            "HIP device: %d (%s)\n",
+            requested_hip_device,
+            device_identifier.c_str());
+    }
 
     std::printf(
         "Search ranges: a[%llu, %llu], b[%llu, %llu]\n",

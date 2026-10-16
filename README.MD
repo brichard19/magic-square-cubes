@@ -74,6 +74,8 @@ magic-square-cubes-stage1 [options]
   --buffer-size SIZE   same as -m
   -j N                 number of CPU worker threads
   --threads N          same as -j
+  -d N                 HIP device index
+  --hip-device N       same as -d
   --backend cpu|gpu    select the search backend
   -h, --help           show command-line help
 ```
@@ -81,7 +83,7 @@ magic-square-cubes-stage1 [options]
 Defaults:
 
 ```text
--a 1:100000 -b 2:100000 -m 1GB -j 1 --backend cpu
+-a 1:100000 -b 2:100000 -m 1GB -j 1 -d 0 --backend cpu
 ```
 
 Buffer sizes may use `B`, `KB`, `MB`, or `GB`. These suffixes use powers of
@@ -118,6 +120,7 @@ make hip
     -a 1:50000 \
     -b 1:50000 \
     -m 1GB \
+    --hip-device 0 \
     --backend gpu
 ```
 
@@ -125,7 +128,9 @@ The HIP executable also contains the CPU backend, so it may be run with
 `--backend cpu`.
 
 The GPU backend uses one host worker. The `-j` value therefore does not
-increase GPU concurrency.
+increase GPU concurrency. Use `-d` or `--hip-device` to select a device by its
+zero-based HIP index. The GPU worker selects that device before querying its
+properties or launching kernels.
 
 ## Partitioning and memory
 
@@ -185,8 +190,14 @@ Results are written beneath the current directory:
 
 ```text
 <hostname>/CPU/
-<hostname>/GPU/
+<hostname>/GPU-<device-ID>/
 ```
+
+GPU directories use the 16-byte UUID reported in `hipDeviceProp_t`. AMD HIP
+commonly reports this as a printable serial number, producing a directory such
+as `GPU-295cea3615cef364`. A binary UUID is formatted as 32 hexadecimal digits.
+If the runtime reports an all-zero UUID, the program instead uses
+`GPU-pci-<domain>-<bus>-<device>`.
 
 There are 32 bucket files named:
 

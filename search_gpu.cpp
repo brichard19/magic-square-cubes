@@ -17,6 +17,8 @@ namespace {
 constexpr std::size_t gpu_pair_storage_size =
     sizeof(u128) + 2 * sizeof(u32);
 
+int configured_hip_device = 0;
+
 struct gpu_pair_span {
     u32 a;
     u32 min_b;
@@ -48,14 +50,15 @@ static void check_hip(
 
 static unsigned int active_device_wavefront_size()
 {
-    int device = 0;
     check_hip(
-        hipGetDevice(&device),
-        "get active HIP device");
+        hipSetDevice(configured_hip_device),
+        "select HIP device");
 
     hipDeviceProp_t properties{};
     check_hip(
-        hipGetDeviceProperties(&properties, device),
+        hipGetDeviceProperties(
+            &properties,
+            configured_hip_device),
         "get HIP device properties");
 
     if (properties.warpSize <= 0 ||
@@ -456,6 +459,95 @@ u64 gpu_pair_record_max_count() noexcept
     return static_cast<u64>(
         std::numeric_limits<std::size_t>::max() /
         gpu_pair_storage_size);
+}
+
+void set_hip_device(int device)
+{
+    if (device < 0) {
+        throw std::invalid_argument(
+            "HIP device index must not be negative");
+    }
+
+    configured_hip_device = device;
+}
+
+std::string hip_device_identifier(int device)
+{
+    if (device < 0) {
+        throw std::invalid_argument(
+            "HIP device index must not be negative");
+    }
+
+    hipDeviceProp_t properties{};
+    check_hip(
+        hipGetDeviceProperties(&properties, device),
+        "get HIP device properties");
+
+    bool uuid_is_nonzero = false;
+    bool uuid_is_safe_text = true;
+
+    for (const char byte : properties.uuid.bytes) {
+        if (byte != 0) {
+            uuid_is_nonzero = true;
+        }
+
+        const unsigned char character =
+            static_cast<unsigned char>(byte);
+
+        if (!((character >= '0' && character <= '9') ||
+              (character >= 'a' && character <= 'z') ||
+              (character >= 'A' && character <= 'Z') ||
+              character == '-' || character == '_'))
+        {
+            uuid_is_safe_text = false;
+        }
+    }
+
+    // AMD's HIP runtime commonly exposes the GPU serial number as 16
+    // printable bytes (for example, "295cea3615cef364").  Preserve that
+    // representation so directory names match the other GPU tools.
+    if (uuid_is_nonzero && uuid_is_safe_text) {
+        return std::string(
+            properties.uuid.bytes,
+            sizeof(properties.uuid.bytes));
+    }
+
+    if (uuid_is_nonzero) {
+        static constexpr char hex[] =
+            "0123456789abcdef";
+
+        std::string identifier;
+        identifier.reserve(
+            2 * sizeof(properties.uuid.bytes));
+
+        for (std::size_t i = 0;
+             i < sizeof(properties.uuid.bytes);
+             ++i)
+        {
+            const unsigned int byte =
+                static_cast<unsigned char>(
+                    properties.uuid.bytes[i]);
+
+            identifier.push_back(hex[byte >> 4]);
+            identifier.push_back(hex[byte & 0x0f]);
+        }
+
+        return identifier;
+    }
+
+    char identifier[64];
+    std::snprintf(
+        identifier,
+        sizeof(identifier),
+        "pci-%04x-%02x-%02x",
+        static_cast<unsigned int>(
+            properties.pciDomainID),
+        static_cast<unsigned int>(
+            properties.pciBusID),
+        static_cast<unsigned int>(
+            properties.pciDeviceID));
+
+    return identifier;
 }
 
 std::vector<collision_record> search_partition_collisions_gpu(
