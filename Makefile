@@ -1,10 +1,13 @@
 CXX ?= g++
 HIPCC ?= hipcc
+MPICXX ?= mpicxx
 
 CXXFLAGS ?= -std=c++17 -O3 -Wall -Wextra -pthread
 DEBUG_CXXFLAGS ?= -std=c++17 -O0 -g3 -Wall -Wextra -pthread
 HIPFLAGS ?= -std=c++17 -O3 -Wall -Wextra -pthread
 HIP_DEBUG_FLAGS ?= -std=c++17 -O0 -g3 -Wall -Wextra -pthread
+MPI_COMPILE_FLAGS ?= $(shell $(MPICXX) --showme:compile)
+MPI_LINK_FLAGS ?= $(shell $(MPICXX) --showme:link)
 CPPFLAGS ?=
 LDFLAGS ?=
 LDLIBS ?=
@@ -13,12 +16,16 @@ TARGET := magic-square-cubes-stage1
 DEBUG_TARGET := magic-square-cubes-stage1-debug
 HIP_TARGET := magic-square-cubes-stage1-hip
 HIP_DEBUG_TARGET := magic-square-cubes-stage1-hip-debug
+MPI_TARGET := magic-square-cubes-stage1-mpi
+MPI_DEBUG_TARGET := magic-square-cubes-stage1-mpi-debug
+HIP_MPI_TARGET := magic-square-cubes-stage1-hip-mpi
+HIP_MPI_DEBUG_TARGET := magic-square-cubes-stage1-hip-mpi-debug
 SOURCES := stage1.cpp search_cpu.cpp
 HEADERS := search.h search_cpu.h
 HIP_SOURCES := $(SOURCES) search_gpu.cpp
 HIP_HEADERS := $(HEADERS) search_gpu.h
 
-.PHONY: all debug hip hip-debug gpu clean
+.PHONY: all debug mpi mpi-debug hip hip-debug gpu hip-mpi hip-mpi-debug clean
 
 all: $(TARGET)
 
@@ -30,6 +37,16 @@ debug: $(DEBUG_TARGET)
 $(DEBUG_TARGET): $(SOURCES) $(HEADERS)
 	$(CXX) $(CPPFLAGS) $(DEBUG_CXXFLAGS) $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
 
+mpi: $(MPI_TARGET)
+
+$(MPI_TARGET): $(SOURCES) $(HEADERS)
+	$(MPICXX) $(CPPFLAGS) -DMAGIC_SQUARE_CUBES_ENABLE_MPI $(CXXFLAGS) $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
+
+mpi-debug: $(MPI_DEBUG_TARGET)
+
+$(MPI_DEBUG_TARGET): $(SOURCES) $(HEADERS)
+	$(MPICXX) $(CPPFLAGS) -DMAGIC_SQUARE_CUBES_ENABLE_MPI $(DEBUG_CXXFLAGS) $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
+
 hip gpu: $(HIP_TARGET)
 
 $(HIP_TARGET): $(HIP_SOURCES) $(HIP_HEADERS)
@@ -40,5 +57,15 @@ hip-debug: $(HIP_DEBUG_TARGET)
 $(HIP_DEBUG_TARGET): $(HIP_SOURCES) $(HIP_HEADERS)
 	$(HIPCC) $(CPPFLAGS) -DMAGIC_SQUARE_CUBES_ENABLE_HIP $(HIP_DEBUG_FLAGS) $(HIP_SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
 
+hip-mpi: $(HIP_MPI_TARGET)
+
+$(HIP_MPI_TARGET): $(HIP_SOURCES) $(HIP_HEADERS)
+	$(HIPCC) $(CPPFLAGS) $(MPI_COMPILE_FLAGS) -DMAGIC_SQUARE_CUBES_ENABLE_HIP -DMAGIC_SQUARE_CUBES_ENABLE_MPI $(HIPFLAGS) $(HIP_SOURCES) $(LDFLAGS) $(LDLIBS) $(MPI_LINK_FLAGS) -o $@
+
+hip-mpi-debug: $(HIP_MPI_DEBUG_TARGET)
+
+$(HIP_MPI_DEBUG_TARGET): $(HIP_SOURCES) $(HIP_HEADERS)
+	$(HIPCC) $(CPPFLAGS) $(MPI_COMPILE_FLAGS) -DMAGIC_SQUARE_CUBES_ENABLE_HIP -DMAGIC_SQUARE_CUBES_ENABLE_MPI $(HIP_DEBUG_FLAGS) $(HIP_SOURCES) $(LDFLAGS) $(LDLIBS) $(MPI_LINK_FLAGS) -o $@
+
 clean:
-	$(RM) $(TARGET) $(DEBUG_TARGET) $(HIP_TARGET) $(HIP_DEBUG_TARGET)
+	$(RM) $(TARGET) $(DEBUG_TARGET) $(MPI_TARGET) $(MPI_DEBUG_TARGET) $(HIP_TARGET) $(HIP_DEBUG_TARGET) $(HIP_MPI_TARGET) $(HIP_MPI_DEBUG_TARGET)

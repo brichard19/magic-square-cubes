@@ -3,6 +3,11 @@
 #ifdef MAGIC_SQUARE_CUBES_ENABLE_HIP
 #include "search_gpu.h"
 #endif
+#ifdef MAGIC_SQUARE_CUBES_ENABLE_MPI
+#define OMPI_SKIP_MPICXX 1
+#define MPICH_SKIP_MPICXX 1
+#include <mpi.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -10,6 +15,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -28,6 +34,95 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+
+#ifdef MAGIC_SQUARE_CUBES_ENABLE_MPI
+
+static void check_mpi(int result, const char* operation)
+{
+    if (result == MPI_SUCCESS)
+        return;
+
+    char message[MPI_MAX_ERROR_STRING]{};
+    int message_length = 0;
+    MPI_Error_string(
+        result,
+        message,
+        &message_length);
+
+    throw std::runtime_error(
+        std::string(operation) + ": " +
+        std::string(message, message_length));
+}
+
+class mpi_environment {
+public:
+    mpi_environment(int& argc, char**& argv)
+    {
+        int provided = MPI_THREAD_SINGLE;
+        const int initialization_result =
+            MPI_Init_thread(
+                &argc,
+                &argv,
+                MPI_THREAD_FUNNELED,
+                &provided);
+
+        if (initialization_result != MPI_SUCCESS) {
+            throw std::runtime_error(
+                "MPI_Init_thread failed");
+        }
+
+        initialized_ = true;
+
+        try {
+            if (provided < MPI_THREAD_FUNNELED) {
+                throw std::runtime_error(
+                    "MPI does not provide MPI_THREAD_FUNNELED");
+            }
+
+            check_mpi(
+                MPI_Comm_set_errhandler(
+                    MPI_COMM_WORLD,
+                    MPI_ERRORS_RETURN),
+                "MPI_Comm_set_errhandler");
+            check_mpi(
+                MPI_Comm_rank(MPI_COMM_WORLD, &rank_),
+                "MPI_Comm_rank");
+            check_mpi(
+                MPI_Comm_size(MPI_COMM_WORLD, &size_),
+                "MPI_Comm_size");
+        }
+        catch (...) {
+            (void)MPI_Finalize();
+            initialized_ = false;
+            throw;
+        }
+    }
+
+    ~mpi_environment()
+    {
+        if (initialized_)
+            (void)MPI_Finalize();
+    }
+
+    mpi_environment(const mpi_environment&) = delete;
+    mpi_environment& operator=(const mpi_environment&) = delete;
+
+    int rank() const noexcept { return rank_; }
+    int size() const noexcept { return size_; }
+
+    void abort(int error_code) const noexcept
+    {
+        if (initialized_)
+            (void)MPI_Abort(MPI_COMM_WORLD, error_code);
+    }
+
+private:
+    bool initialized_ = false;
+    int rank_ = 0;
+    int size_ = 1;
+};
+
+#endif
 
 struct partition_stats {
     u64 min_a = 0;
@@ -200,7 +295,7 @@ static void print_usage(const char* program)
         "[--backend cpu|gpu]\n"
         "  -m, --buffer-size SIZE  target pair buffer size; B, KB, MB, GB use powers of 1024\n"
         "  -j, --threads N         worker threads; pair buffer applies to each worker\n"
-        "  -d, --hip-device N      HIP device index for the GPU backend\n"
+        "  -d, --hip-device N      HIP device index; first local device under MPI\n"
         "      --backend TYPE      search backend: cpu or gpu\n"
         "Defaults: -a 1:100000 -b 2:100000 -m 1GB -j 1 -d 0 --backend cpu\n",
         program);
@@ -487,6 +582,500 @@ private:
     std::condition_variable not_full_;
     std::deque<partition_result> results_;
 };
+
+#ifdef MAGIC_SQUARE_CUBES_ENABLE_MPI
+
+enum mpi_message_tag : int {
+    mpi_partition_tag = 1,
+    mpi_stop_tag = 2,
+    mpi_result_header_tag = 3,
+    mpi_result_records_tag = 4
+};
+
+struct mpi_partition_message {
+    u64 partition_index;
+    u64 partition_count;
+    u64 min_a;
+    u64 min_b;
+    u64 max_a;
+    u64 max_b;
+    u64 s_min_low;
+    u64 s_min_high;
+    u64 s_max_low;
+    u64 s_max_high;
+    u64 pair_count;
+};
+
+struct mpi_result_header {
+    u64 partition_index;
+    u64 collision_count;
+    double elapsed_seconds;
+};
+
+static_assert(
+    std::is_trivially_copyable_v<mpi_partition_message>);
+static_assert(
+    std::is_trivially_copyable_v<mpi_result_header>);
+static_assert(
+    std::is_trivially_copyable_v<collision_record>);
+
+template <typename T>
+static void mpi_send_object(
+    const T& value,
+    int destination,
+    int tag)
+{
+    static_assert(std::is_trivially_copyable_v<T>);
+    static_assert(sizeof(T) <= INT_MAX);
+
+    check_mpi(
+        MPI_Send(
+            &value,
+            static_cast<int>(sizeof(T)),
+            MPI_BYTE,
+            destination,
+            tag,
+            MPI_COMM_WORLD),
+        "MPI_Send");
+}
+
+template <typename T>
+static void mpi_receive_object(
+    T& value,
+    int source,
+    int tag,
+    MPI_Status* status = MPI_STATUS_IGNORE)
+{
+    static_assert(std::is_trivially_copyable_v<T>);
+    static_assert(sizeof(T) <= INT_MAX);
+
+    check_mpi(
+        MPI_Recv(
+            &value,
+            static_cast<int>(sizeof(T)),
+            MPI_BYTE,
+            source,
+            tag,
+            MPI_COMM_WORLD,
+            status),
+        "MPI_Recv");
+}
+
+static void mpi_send_bytes(
+    const void* data,
+    std::size_t byte_count,
+    int destination,
+    int tag)
+{
+    const auto* bytes =
+        static_cast<const unsigned char*>(data);
+
+    while (byte_count != 0) {
+        const int chunk_size = static_cast<int>(
+            std::min<std::size_t>(
+                byte_count,
+                static_cast<std::size_t>(INT_MAX)));
+
+        check_mpi(
+            MPI_Send(
+                bytes,
+                chunk_size,
+                MPI_BYTE,
+                destination,
+                tag,
+                MPI_COMM_WORLD),
+            "MPI_Send collision records");
+
+        bytes += chunk_size;
+        byte_count -= static_cast<std::size_t>(chunk_size);
+    }
+}
+
+static void mpi_receive_bytes(
+    void* data,
+    std::size_t byte_count,
+    int source,
+    int tag)
+{
+    auto* bytes = static_cast<unsigned char*>(data);
+
+    while (byte_count != 0) {
+        const int chunk_size = static_cast<int>(
+            std::min<std::size_t>(
+                byte_count,
+                static_cast<std::size_t>(INT_MAX)));
+
+        check_mpi(
+            MPI_Recv(
+                bytes,
+                chunk_size,
+                MPI_BYTE,
+                source,
+                tag,
+                MPI_COMM_WORLD,
+                MPI_STATUS_IGNORE),
+            "MPI_Recv collision records");
+
+        bytes += chunk_size;
+        byte_count -= static_cast<std::size_t>(chunk_size);
+    }
+}
+
+static mpi_partition_message make_mpi_partition_message(
+    const search_partition& partition,
+    std::size_t partition_index,
+    std::size_t partition_count)
+{
+    return {
+        static_cast<u64>(partition_index),
+        static_cast<u64>(partition_count),
+        partition.min_a,
+        partition.min_b,
+        partition.max_a,
+        partition.max_b,
+        static_cast<u64>(partition.s_min),
+        static_cast<u64>(partition.s_min >> 64),
+        static_cast<u64>(partition.s_max),
+        static_cast<u64>(partition.s_max >> 64),
+        partition.pair_count
+    };
+}
+
+static search_partition search_partition_from_mpi(
+    const mpi_partition_message& message)
+{
+    return {
+        message.min_a,
+        message.min_b,
+        message.max_a,
+        message.max_b,
+        (u128(message.s_min_high) << 64) |
+            message.s_min_low,
+        (u128(message.s_max_high) << 64) |
+            message.s_max_low,
+        message.pair_count
+    };
+}
+
+static void mpi_send_partition(
+    const std::vector<search_partition>& partitions,
+    std::size_t partition_index,
+    int worker_rank)
+{
+    const auto message = make_mpi_partition_message(
+        partitions[partition_index],
+        partition_index,
+        partitions.size());
+
+    mpi_send_object(
+        message,
+        worker_rank,
+        mpi_partition_tag);
+
+    std::printf(
+        "Assigned partition %zu/%zu to MPI worker rank %d "
+        "(pair_count=%llu).\n",
+        partition_index + 1,
+        partitions.size(),
+        worker_rank,
+        (unsigned long long)
+            partitions[partition_index].pair_count);
+    std::fflush(stdout);
+}
+
+static void mpi_send_stop(int worker_rank)
+{
+    const unsigned char stop = 0;
+    mpi_send_object(stop, worker_rank, mpi_stop_tag);
+}
+
+static void run_mpi_coordinator(
+    const std::vector<search_partition>& partitions,
+    int world_size,
+    std::string_view backend_directory)
+{
+    if (partitions.empty()) {
+        for (int worker_rank = 1;
+             worker_rank < world_size;
+             ++worker_rank)
+        {
+            mpi_send_stop(worker_rank);
+        }
+        return;
+    }
+
+    collision_bucket_writer collision_buckets(
+        backend_directory);
+
+    std::printf(
+        "Collision output directory: %s\n",
+        collision_buckets.output_directory()
+            .string().c_str());
+    std::fflush(stdout);
+
+    std::size_t next_partition = 0;
+
+    for (int worker_rank = 1;
+         worker_rank < world_size;
+         ++worker_rank)
+    {
+        if (next_partition < partitions.size()) {
+            mpi_send_partition(
+                partitions,
+                next_partition++,
+                worker_rank);
+        }
+        else {
+            mpi_send_stop(worker_rank);
+        }
+    }
+
+    std::vector<bool> completed(partitions.size(), false);
+    std::size_t completed_count = 0;
+    u64 total_collision_count = 0;
+
+    while (completed_count < partitions.size()) {
+        mpi_result_header header{};
+        MPI_Status status{};
+
+        mpi_receive_object(
+            header,
+            MPI_ANY_SOURCE,
+            mpi_result_header_tag,
+            &status);
+
+        if (header.partition_index >= partitions.size()) {
+            throw std::runtime_error(
+                "MPI worker returned an invalid partition index");
+        }
+
+        const std::size_t partition_index =
+            static_cast<std::size_t>(
+                header.partition_index);
+
+        if (completed[partition_index]) {
+            throw std::runtime_error(
+                "MPI worker returned a partition more than once");
+        }
+
+        if (header.collision_count >
+            std::vector<collision_record>().max_size())
+        {
+            throw std::length_error(
+                "MPI collision result is too large");
+        }
+
+        std::vector<collision_record> collisions(
+            static_cast<std::size_t>(
+                header.collision_count));
+
+        if (collisions.size() >
+            std::numeric_limits<std::size_t>::max() /
+                sizeof(collision_record))
+        {
+            throw std::length_error(
+                "MPI collision byte count overflow");
+        }
+
+        mpi_receive_bytes(
+            collisions.data(),
+            collisions.size() * sizeof(collision_record),
+            status.MPI_SOURCE,
+            mpi_result_records_tag);
+
+        for (const auto& collision : collisions)
+            collision_buckets.add(collision);
+
+        if (header.collision_count >
+            std::numeric_limits<u64>::max() -
+                total_collision_count)
+        {
+            throw std::overflow_error(
+                "total collision count overflow");
+        }
+
+        total_collision_count += header.collision_count;
+        completed[partition_index] = true;
+        ++completed_count;
+
+        const double operations_per_second =
+            header.elapsed_seconds > 0.0
+                ? static_cast<double>(
+                    partitions[partition_index].pair_count) /
+                    header.elapsed_seconds
+                : 0.0;
+
+        std::printf(
+            "MPI worker rank %d completed partition %zu/%zu: "
+            "%llu collisions found, %.2f Mops/sec (%.3f s); "
+            "%zu/%zu partitions bucketed, %llu collisions total\n",
+            status.MPI_SOURCE,
+            partition_index + 1,
+            partitions.size(),
+            (unsigned long long)header.collision_count,
+            operations_per_second / 1'000'000.0,
+            header.elapsed_seconds,
+            completed_count,
+            partitions.size(),
+            (unsigned long long)total_collision_count);
+        std::fflush(stdout);
+
+        if (next_partition < partitions.size()) {
+            mpi_send_partition(
+                partitions,
+                next_partition++,
+                status.MPI_SOURCE);
+        }
+        else {
+            mpi_send_stop(status.MPI_SOURCE);
+        }
+    }
+
+    collision_buckets.flush_all();
+
+    std::printf(
+        "Appended %llu collisions from all partitions "
+        "to the bucket files.\n",
+        (unsigned long long)total_collision_count);
+    std::fflush(stdout);
+}
+
+static void run_mpi_worker(
+    partition_search_function* search_backend_function,
+    int world_rank)
+{
+    while (true) {
+        MPI_Status status{};
+        check_mpi(
+            MPI_Probe(
+                0,
+                MPI_ANY_TAG,
+                MPI_COMM_WORLD,
+                &status),
+            "MPI_Probe");
+
+        if (status.MPI_TAG == mpi_stop_tag) {
+            unsigned char stop = 0;
+            mpi_receive_object(
+                stop,
+                0,
+                mpi_stop_tag);
+            break;
+        }
+
+        if (status.MPI_TAG != mpi_partition_tag) {
+            throw std::runtime_error(
+                "MPI worker received an unexpected message");
+        }
+
+        mpi_partition_message message{};
+        mpi_receive_object(
+            message,
+            0,
+            mpi_partition_tag);
+
+        const search_partition partition =
+            search_partition_from_mpi(message);
+
+        std::printf(
+            "MPI worker rank %d processing partition %llu/%llu "
+            "(pair_count=%llu)...\n",
+            world_rank,
+            (unsigned long long)message.partition_index + 1,
+            (unsigned long long)message.partition_count,
+            (unsigned long long)partition.pair_count);
+        std::fflush(stdout);
+
+        const auto search_start =
+            std::chrono::steady_clock::now();
+
+        auto collisions =
+            search_backend_function(partition);
+
+        const auto search_end =
+            std::chrono::steady_clock::now();
+
+        const double elapsed_seconds =
+            std::chrono::duration<double>(
+                search_end - search_start).count();
+
+        const mpi_result_header header{
+            message.partition_index,
+            static_cast<u64>(collisions.size()),
+            elapsed_seconds
+        };
+
+        mpi_send_object(
+            header,
+            0,
+            mpi_result_header_tag);
+
+        mpi_send_bytes(
+            collisions.data(),
+            collisions.size() * sizeof(collision_record),
+            0,
+            mpi_result_records_tag);
+    }
+}
+
+static int mpi_worker_device_index(
+    int world_rank,
+    int first_device)
+{
+    MPI_Comm local_communicator = MPI_COMM_NULL;
+    check_mpi(
+        MPI_Comm_split_type(
+            MPI_COMM_WORLD,
+            MPI_COMM_TYPE_SHARED,
+            world_rank,
+            MPI_INFO_NULL,
+            &local_communicator),
+        "MPI_Comm_split_type");
+
+    int local_rank = 0;
+    check_mpi(
+        MPI_Comm_rank(
+            local_communicator,
+            &local_rank),
+        "MPI_Comm_rank for shared-memory communicator");
+
+    const int coordinator_candidate =
+        world_rank == 0 ? local_rank : -1;
+    int coordinator_local_rank = -1;
+
+    check_mpi(
+        MPI_Allreduce(
+            &coordinator_candidate,
+            &coordinator_local_rank,
+            1,
+            MPI_INT,
+            MPI_MAX,
+            local_communicator),
+        "MPI_Allreduce coordinator local rank");
+
+    int worker_local_index = local_rank;
+    if (coordinator_local_rank >= 0 &&
+        local_rank > coordinator_local_rank)
+    {
+        --worker_local_index;
+    }
+
+    check_mpi(
+        MPI_Comm_free(&local_communicator),
+        "MPI_Comm_free");
+
+    if (first_device >
+        std::numeric_limits<int>::max() -
+            worker_local_index)
+    {
+        throw std::overflow_error(
+            "MPI worker HIP device index overflow");
+    }
+
+    return first_device + worker_local_index;
+}
+
+#endif
 
 // Count all pairs satisfying:
 //
@@ -954,8 +1543,15 @@ std::vector<search_partition> make_partitions(
 }
 
 
-int main(int argc, char* argv[])
+static int run_stage1(
+    int argc,
+    char* argv[],
+    int mpi_rank,
+    int mpi_size)
 {
+    const bool distributed = mpi_size > 1;
+    const bool coordinator = mpi_rank == 0;
+
     u64 min_a = 1;
     u64 min_b = 2;
     u64 max_a = 100000;
@@ -969,7 +1565,8 @@ int main(int argc, char* argv[])
         const std::string_view option = argv[i];
 
         if (option == "-h" || option == "--help") {
-            print_usage(argv[0]);
+            if (coordinator)
+                print_usage(argv[0]);
             return 0;
         }
 
@@ -1130,6 +1727,16 @@ int main(int argc, char* argv[])
         cpu_pair_record_size();
     u64 pair_record_max_count =
         cpu_pair_record_max_count();
+    int effective_hip_device = requested_hip_device;
+
+#ifdef MAGIC_SQUARE_CUBES_ENABLE_MPI
+    if (use_gpu && distributed) {
+        effective_hip_device =
+            mpi_worker_device_index(
+                mpi_rank,
+                requested_hip_device);
+    }
+#endif
 
     if (use_gpu) {
 #ifdef MAGIC_SQUARE_CUBES_ENABLE_HIP
@@ -1140,30 +1747,46 @@ int main(int argc, char* argv[])
         pair_record_max_count =
             gpu_pair_record_max_count();
 
-        try {
-            set_hip_device(requested_hip_device);
-            device_identifier =
-                hip_device_identifier(
-                    requested_hip_device);
-            backend_directory =
-                "GPU-" + device_identifier;
+        if (distributed && coordinator) {
+            backend_directory = "MPI-GPU";
         }
-        catch (const std::exception& error) {
-            std::fprintf(
-                stderr,
-                "Unable to configure HIP device %d: %s\n",
-                requested_hip_device,
-                error.what());
-            return 1;
+        else {
+            try {
+                set_hip_device(effective_hip_device);
+                device_identifier =
+                    hip_device_identifier(
+                        effective_hip_device);
+                backend_directory =
+                    "GPU-" + device_identifier;
+            }
+            catch (const std::exception& error) {
+                std::fprintf(
+                    stderr,
+                    "MPI rank %d unable to configure HIP "
+                    "device %d: %s\n",
+                    mpi_rank,
+                    effective_hip_device,
+                    error.what());
+#ifdef MAGIC_SQUARE_CUBES_ENABLE_MPI
+                if (distributed)
+                    (void)MPI_Abort(MPI_COMM_WORLD, 1);
+#endif
+                return 1;
+            }
         }
 #else
-        std::fprintf(
-            stderr,
-            "The GPU backend is unavailable in this build. "
-            "Run 'make hip' and use the resulting "
-            "magic-square-cubes-stage1-hip executable.\n");
+        if (coordinator) {
+            std::fprintf(
+                stderr,
+                "The GPU backend is unavailable in this build. "
+                "Run 'make hip' and use the resulting "
+                "magic-square-cubes-stage1-hip executable.\n");
+        }
         return 1;
 #endif
+    }
+    else if (distributed) {
+        backend_directory = "MPI-CPU";
     }
 
     const u64 target_pair_records =
@@ -1187,88 +1810,152 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    std::printf(
-        "Search backend: %s\n",
-        backend_name);
+    if (coordinator) {
+        std::printf(
+            "Search backend: %s%s\n",
+            backend_name,
+            distributed ? " with MPI" : "");
+    }
 
-    if (use_gpu) {
+    if (use_gpu && !distributed) {
         std::printf(
             "HIP device: %d (%s)\n",
-            requested_hip_device,
+            effective_hip_device,
+            device_identifier.c_str());
+    }
+    else if (use_gpu && !coordinator) {
+        std::printf(
+            "MPI worker rank %d using HIP device %d (%s)\n",
+            mpi_rank,
+            effective_hip_device,
             device_identifier.c_str());
     }
 
-    std::printf(
-        "Search ranges: a[%llu, %llu], b[%llu, %llu]\n",
-        (unsigned long long)min_a,
-        (unsigned long long)max_a,
-        (unsigned long long)min_b,
-        (unsigned long long)max_b);
-
-    std::printf(
-        "Pair buffer target: %llu bytes (%llu records, %zu bytes each)\n",
-        (unsigned long long)buffer_size_bytes,
-        (unsigned long long)target_pair_records,
-        pair_record_size);
-
-    if (use_gpu) {
+    if (coordinator) {
         std::printf(
-            "GPU sorting: device-wide radix sort of "
-            "unsigned 128-bit sums\n");
+            "Search ranges: a[%llu, %llu], b[%llu, %llu]\n",
+            (unsigned long long)min_a,
+            (unsigned long long)max_a,
+            (unsigned long long)min_b,
+            (unsigned long long)max_b);
+
+        std::printf(
+            "Pair buffer target: %llu bytes (%llu records, %zu bytes each)\n",
+            (unsigned long long)buffer_size_bytes,
+            (unsigned long long)target_pair_records,
+            pair_record_size);
+
+        if (use_gpu) {
+            std::printf(
+                "GPU sorting: device-wide radix sort of "
+                "unsigned 128-bit sums\n");
+        }
+
+        if (distributed) {
+            std::printf(
+                "MPI ranks: %d total, 1 coordinator, %d workers\n",
+                mpi_size,
+                mpi_size - 1);
+        }
     }
 
     std::fflush(stdout);
 
     std::vector<search_partition> partitions;
 
-    try {
-        partitions =
-            make_partitions(
-                min_a,
-                min_b,
-                max_a,
-                max_b,
-                target_pair_records);
-    }
-    catch (const std::exception& error) {
-        std::fprintf(
-            stderr,
-            "Unable to partition the search: %s\n",
-            error.what());
-        return 1;
+    if (coordinator) {
+        try {
+            partitions =
+                make_partitions(
+                    min_a,
+                    min_b,
+                    max_a,
+                    max_b,
+                    target_pair_records);
+        }
+        catch (const std::exception& error) {
+            std::fprintf(
+                stderr,
+                "Unable to partition the search: %s\n",
+                error.what());
+#ifdef MAGIC_SQUARE_CUBES_ENABLE_MPI
+            if (distributed)
+                (void)MPI_Abort(MPI_COMM_WORLD, 1);
+#endif
+            return 1;
+        }
     }
 
-    if (partitions.empty()) {
+    if (coordinator && partitions.empty()) {
         std::printf(
             "No pairs satisfy the specified ranges and a < b.\n");
+    }
+
+    if (coordinator) {
+        for (std::size_t i = 0;
+             i < partitions.size();
+             ++i)
+        {
+            const auto& partition = partitions[i];
+
+            printf("Partition %zu/%zu: a[%llu, %llu], b[%llu, %llu], s[%llu, %llu), pair_count=%llu\n",
+                   i + 1,
+                   partitions.size(),
+                   (unsigned long long)partition.min_a,
+                   (unsigned long long)partition.max_a,
+                   (unsigned long long)partition.min_b,
+                   (unsigned long long)partition.max_b,
+                   (unsigned long long)partition.s_min,
+                   (unsigned long long)partition.s_max,
+                   (unsigned long long)partition.pair_count);
+        }
+
+        if (!partitions.empty()) {
+            std::printf(
+                "Collision buckets: %zu files, %zu bytes "
+                "(%zu records of %zu bytes) per in-memory bucket\n",
+                collision_bucket_writer::bucket_count,
+                collision_bucket_writer::bucket_size_bytes,
+                collision_bucket_writer::records_per_bucket,
+                sizeof(collision_record));
+        }
+    }
+
+#ifdef MAGIC_SQUARE_CUBES_ENABLE_MPI
+    if (distributed) {
+        try {
+            if (coordinator) {
+                run_mpi_coordinator(
+                    partitions,
+                    mpi_size,
+                    backend_directory);
+            }
+            else {
+                run_mpi_worker(
+                    search_backend_function,
+                    mpi_rank);
+            }
+
+            check_mpi(
+                MPI_Barrier(MPI_COMM_WORLD),
+                "MPI_Barrier");
+        }
+        catch (const std::exception& error) {
+            std::fprintf(
+                stderr,
+                "MPI rank %d failed: %s\n",
+                mpi_rank,
+                error.what());
+            (void)MPI_Abort(MPI_COMM_WORLD, 1);
+            return 1;
+        }
+
         return 0;
     }
+#endif
 
-    for (std::size_t i = 0;
-         i < partitions.size();
-         ++i)
-    {
-        const auto& partition = partitions[i];
-
-        printf("Partition %zu/%zu: a[%llu, %llu], b[%llu, %llu], s[%llu, %llu), pair_count=%llu\n",
-               i + 1,
-               partitions.size(),
-               (unsigned long long)partition.min_a,
-               (unsigned long long)partition.max_a,
-               (unsigned long long)partition.min_b,
-               (unsigned long long)partition.max_b,
-               (unsigned long long)partition.s_min,
-               (unsigned long long)partition.s_max,
-               (unsigned long long)partition.pair_count);
-    }
-
-    std::printf(
-        "Collision buckets: %zu files, %zu bytes "
-        "(%zu records of %zu bytes) per in-memory bucket\n",
-        collision_bucket_writer::bucket_count,
-        collision_bucket_writer::bucket_size_bytes,
-        collision_bucket_writer::records_per_bucket,
-        sizeof(collision_record));
+    if (partitions.empty())
+        return 0;
 
     const std::size_t backend_worker_count =
         use_gpu ? 1 : requested_thread_count;
@@ -1559,4 +2246,41 @@ int main(int argc, char* argv[])
     }
 
     return 0;
+}
+
+int main(int argc, char* argv[])
+{
+#ifdef MAGIC_SQUARE_CUBES_ENABLE_MPI
+    try {
+        mpi_environment mpi(argc, argv);
+
+        try {
+            return run_stage1(
+                argc,
+                argv,
+                mpi.rank(),
+                mpi.size());
+        }
+        catch (const std::exception& error) {
+            std::fprintf(
+                stderr,
+                "MPI stage 1 failed: %s\n",
+                error.what());
+
+            if (mpi.size() > 1)
+                mpi.abort(1);
+
+            return 1;
+        }
+    }
+    catch (const std::exception& error) {
+        std::fprintf(
+            stderr,
+            "Unable to initialize MPI: %s\n",
+            error.what());
+        return 1;
+    }
+#else
+    return run_stage1(argc, argv, 0, 1);
+#endif
 }

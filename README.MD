@@ -38,8 +38,9 @@ The CPU build requires:
 - A C++17 compiler such as `g++`
 - POSIX threads
 
-The GPU build additionally requires AMD ROCm with `hipcc` and a
-HIP-compatible GPU.
+MPI builds require an MPI implementation that provides `mpicxx` and `mpirun`
+(for example, Open MPI). GPU builds additionally require AMD ROCm with
+`hipcc` and a HIP-compatible GPU.
 
 ## Building
 
@@ -55,13 +56,20 @@ Other build targets are:
 
 ```sh
 make debug       # CPU debug build
+make mpi         # Optimized CPU + MPI build
+make mpi-debug   # CPU + MPI debug build
 make hip         # Optimized HIP build
 make hip-debug   # HIP debug build
+make hip-mpi     # Optimized HIP + MPI build
+make hip-mpi-debug # HIP + MPI debug build
 make clean       # Remove generated executables
 ```
 
-The HIP targets create `magic-square-cubes-stage1-hip` and
-`magic-square-cubes-stage1-hip-debug`.
+The CPU MPI targets create `magic-square-cubes-stage1-mpi` and
+`magic-square-cubes-stage1-mpi-debug`. The HIP targets create
+`magic-square-cubes-stage1-hip` and `magic-square-cubes-stage1-hip-debug`.
+The combined HIP and MPI targets create `magic-square-cubes-stage1-hip-mpi`
+and `magic-square-cubes-stage1-hip-mpi-debug`.
 
 ## Usage
 
@@ -74,7 +82,7 @@ magic-square-cubes-stage1 [options]
   --buffer-size SIZE   same as -m
   -j N                 number of CPU worker threads
   --threads N          same as -j
-  -d N                 HIP device index
+  -d N                 HIP device index (first local device under MPI)
   --hip-device N       same as -d
   --backend cpu|gpu    select the search backend
   -h, --help           show command-line help
@@ -131,6 +139,53 @@ The GPU backend uses one host worker. The `-j` value therefore does not
 increase GPU concurrency. Use `-d` or `--hip-device` to select a device by its
 zero-based HIP index. The GPU worker selects that device before querying its
 properties or launching kernels.
+
+### MPI examples
+
+The MPI scheduler also works with the CPU backend. For four CPU worker
+processes plus the coordinator:
+
+```sh
+make mpi
+
+mpirun -np 5 ./magic-square-cubes-stage1-mpi \
+    -a 1:50000 \
+    -b 1:50000 \
+    -m 1GB \
+    --backend cpu
+```
+
+For four GPU workers plus the coordinator:
+
+The MPI build uses rank 0 as a coordinator and every other rank as a worker.
+Consequently, launch one more rank than the number of GPUs. For four GPUs on
+one machine:
+
+```sh
+make hip-mpi
+
+mpirun -np 5 ./magic-square-cubes-stage1-hip-mpi \
+    -a 1:50000 \
+    -b 1:50000 \
+    -m 1GB \
+    --backend gpu
+```
+
+Rank 0 creates the partitions, assigns them dynamically, receives each
+completed collision vector, and is the only process that writes bucket files.
+Workers request work implicitly by returning a result, so faster GPUs receive
+more partitions. Collision-vector transfers are split into chunks when needed
+to stay within MPI's per-message count limit.
+
+Worker ranks are mapped to GPUs by their node-local rank. On the coordinator's
+node, rank 0 is omitted from that numbering; on every other node, the first
+local worker uses GPU 0. `-d N` changes GPU 0 in this description to GPU `N`,
+which is useful when reserving lower-numbered devices. The `-j` option is not
+used in distributed mode because each MPI worker processes one partition at a
+time.
+
+The HIP MPI executable also contains the CPU backend and may be run with
+`--backend cpu`, but the CPU-only MPI executable does not require ROCm.
 
 ## Partitioning and memory
 
@@ -191,6 +246,8 @@ Results are written beneath the current directory:
 ```text
 <hostname>/CPU/
 <hostname>/GPU-<device-ID>/
+<hostname>/MPI-CPU/
+<hostname>/MPI-GPU/
 ```
 
 GPU directories use the 16-byte UUID reported in `hipDeviceProp_t`. AMD HIP
@@ -198,6 +255,10 @@ commonly reports this as a printable serial number, producing a directory such
 as `GPU-295cea3615cef364`. A binary UUID is formatted as 32 hexadecimal digits.
 If the runtime reports an all-zero UUID, the program instead uses
 `GPU-pci-<domain>-<bus>-<device>`.
+
+MPI runs aggregate every worker's collisions on rank 0, so they use one
+`MPI-CPU` or `MPI-GPU` directory beneath the coordinator's hostname rather
+than a directory for each worker device.
 
 There are 32 bucket files named:
 
