@@ -292,12 +292,13 @@ static void print_usage(const char* program)
     std::fprintf(
         stderr,
         "Usage: %s [-a MIN:MAX] [-b MIN:MAX] [-m SIZE] [-j N] [-d N] "
-        "[--backend cpu|gpu]\n"
+        "[--backend cpu|gpu] [--gpu-method hash|radix]\n"
         "  -m, --buffer-size SIZE  target pair buffer size; B, KB, MB, GB use powers of 1024\n"
         "  -j, --threads N         worker threads; pair buffer applies to each worker\n"
         "  -d, --hip-device N      HIP device index; first local device under MPI\n"
         "      --backend TYPE      search backend: cpu or gpu\n"
-        "Defaults: -a 1:100000 -b 2:100000 -m 1GB -j 1 -d 0 --backend cpu\n",
+        "      --gpu-method TYPE   GPU collision method: hash or radix\n"
+        "Defaults: -a 1:100000 -b 2:100000 -m 1GB -j 1 -d 0 --backend cpu --gpu-method hash\n",
         program);
 }
 
@@ -1560,6 +1561,7 @@ static int run_stage1(
     std::size_t requested_thread_count = 1;
     int requested_hip_device = 0;
     bool use_gpu = false;
+    bool use_gpu_hash_table = true;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view option = argv[i];
@@ -1588,11 +1590,15 @@ static int run_stage1(
             option == "-d" ||
             option == "--hip-device";
 
+        const bool is_gpu_method_option =
+            option == "--gpu-method";
+
         if (!is_range_option &&
             !is_buffer_option &&
             !is_thread_option &&
             !is_backend_option &&
-            !is_hip_device_option)
+            !is_hip_device_option &&
+            !is_gpu_method_option)
         {
             std::fprintf(
                 stderr,
@@ -1626,6 +1632,27 @@ static int run_stage1(
                 std::fprintf(
                     stderr,
                     "Invalid backend: %s\n",
+                    value);
+                print_usage(argv[0]);
+                return 1;
+            }
+
+            continue;
+        }
+
+        if (is_gpu_method_option) {
+            const std::string_view method = value;
+
+            if (method == "hash") {
+                use_gpu_hash_table = true;
+            }
+            else if (method == "radix") {
+                use_gpu_hash_table = false;
+            }
+            else {
+                std::fprintf(
+                    stderr,
+                    "Invalid GPU method: %s\n",
                     value);
                 print_usage(argv[0]);
                 return 1;
@@ -1742,10 +1769,17 @@ static int run_stage1(
 #ifdef MAGIC_SQUARE_CUBES_ENABLE_HIP
         backend_name = "HIP GPU";
         search_backend_function =
-            search_partition_collisions_gpu;
-        pair_record_size = gpu_pair_record_size();
+            use_gpu_hash_table
+                ? search_partition_collisions_gpu_hash
+                : search_partition_collisions_gpu_radix;
+        pair_record_size =
+            use_gpu_hash_table
+                ? gpu_hash_pair_record_size()
+                : gpu_pair_record_size();
         pair_record_max_count =
-            gpu_pair_record_max_count();
+            use_gpu_hash_table
+                ? gpu_hash_pair_record_max_count()
+                : gpu_pair_record_max_count();
 
         if (distributed && coordinator) {
             backend_directory = "MPI-GPU";
@@ -1846,9 +1880,16 @@ static int run_stage1(
             pair_record_size);
 
         if (use_gpu) {
-            std::printf(
-                "GPU sorting: device-wide radix sort of "
-                "unsigned 128-bit sums\n");
+            if (use_gpu_hash_table) {
+                std::printf(
+                    "GPU collision method: open-addressed "
+                    "hash table of unsigned 128-bit sums\n");
+            }
+            else {
+                std::printf(
+                    "GPU collision method: device-wide radix "
+                    "sort of unsigned 128-bit sums\n");
+            }
         }
 
         if (distributed) {

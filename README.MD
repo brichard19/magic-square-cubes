@@ -85,13 +85,14 @@ magic-square-cubes-stage1 [options]
   -d N                 HIP device index (first local device under MPI)
   --hip-device N       same as -d
   --backend cpu|gpu    select the search backend
+  --gpu-method TYPE    GPU method: hash or radix
   -h, --help           show command-line help
 ```
 
 Defaults:
 
 ```text
--a 1:100000 -b 2:100000 -m 1GB -j 1 -d 0 --backend cpu
+-a 1:100000 -b 2:100000 -m 1GB -j 1 -d 0 --backend cpu --gpu-method hash
 ```
 
 Buffer sizes may use `B`, `KB`, `MB`, or `GB`. These suffixes use powers of
@@ -129,6 +130,7 @@ make hip
     -b 1:50000 \
     -m 1GB \
     --hip-device 0 \
+    --gpu-method hash \
     --backend gpu
 ```
 
@@ -139,6 +141,17 @@ The GPU backend uses one host worker. The `-j` value therefore does not
 increase GPU concurrency. Use `-d` or `--hip-device` to select a device by its
 zero-based HIP index. The GPU worker selects that device before querying its
 properties or launching kernels.
+
+The GPU backend offers two collision methods:
+
+- `--gpu-method hash` is the default. It inserts every pair into an
+  open-addressed GPU hash table and then scans the completed probe chains for
+  exact equal-sum matches.
+- `--gpu-method radix` generates structure-of-arrays pair buffers, sorts them
+  by sum with rocPRIM, and scans adjacent equal sums.
+
+Keeping both methods makes it possible to compare throughput and memory use on
+the target GPU without rebuilding the program.
 
 ### MPI examples
 
@@ -154,8 +167,6 @@ mpirun -np 5 ./magic-square-cubes-stage1-mpi \
     -m 1GB \
     --backend cpu
 ```
-
-For four GPU workers plus the coordinator:
 
 The MPI build uses rank 0 as a coordinator and every other rank as a worker.
 Consequently, launch one more rank than the number of GPUs. For four GPUs on
@@ -200,7 +211,27 @@ The program may allow a partition to exceed the target when it cannot be split
 without dividing an equal-sum group. On the CPU, the buffer target applies to
 each active worker.
 
-The HIP backend performs these stages for every partition:
+With `--gpu-method hash`, the HIP backend performs these stages for every
+partition:
+
+1. The CPU calculates each valid `[a, b0..bN]` span.
+2. One GPU thread block processes each span and inserts its pairs into an
+   open-addressed table with a maximum load factor of 70%.
+3. A 64-bit atomic tag claims each slot. The full unsigned 128-bit sum remains
+   in the table and is always compared before reporting a collision, so tag
+   collisions do not affect correctness.
+4. GPU kernels first count and then collect equal-sum pairs by scanning probe
+   chains. Every pair is retained in the table, so a sum with more than two
+   representations produces every pairwise collision.
+5. Compact collision inputs are copied to the CPU, where their GCD-based
+   signatures are calculated.
+
+The count pass determines the exact collision-buffer size; no maximum
+collision estimate is required. Hash-table partitioning budgets 48 bytes per
+input pair. The allocated structure-of-arrays table uses 32 bytes per slot and
+has approximately 10 slots for every 7 pairs.
+
+With `--gpu-method radix`, the HIP backend performs these stages:
 
 1. The CPU calculates each valid `[a, b0..bN]` span and its exact prefix-sum
    output offset.
@@ -212,10 +243,10 @@ The HIP backend performs these stages for every partition:
 5. Compact collision inputs are copied to the CPU, where their GCD-based
    signatures are calculated.
 
-GPU pair data uses a structure-of-arrays layout: sums are stored as contiguous
-unsigned 128-bit values, with separate contiguous `uint32_t` arrays for `a` and
-`b`. This keeps each field naturally aligned and allows adjacent GPU threads to
-issue coalesced accesses.
+Radix-sort pair data uses a structure-of-arrays layout: sums are stored as
+contiguous unsigned 128-bit values, with separate contiguous `uint32_t` arrays
+for `a` and `b`. This keeps each field naturally aligned and allows adjacent
+GPU threads to issue coalesced accesses.
 
 Radix sorting does not require power-of-two padding. It does require a second
 set of sum, `a`, and `b` arrays for its output, plus rocPRIM temporary storage.
@@ -232,8 +263,9 @@ At startup, the program reports:
 - Every generated partition
 - Bucket configuration and output directory
 - Active worker count
-- GPU grid and block sizes for generation and collision scanning, plus the
-  rocPRIM radix-sort item count and temporary-storage requirement
+- GPU grid and block sizes for generation and collision scanning
+- Hash-table slot count, load factor, and storage, or the rocPRIM radix-sort
+  item count and temporary-storage requirement
 
 After each partition, it reports the collision count, elapsed search time, and
 throughput in `Mops/sec`. One operation means one `(a,b)` pair processed. The

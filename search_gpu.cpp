@@ -17,6 +17,16 @@ namespace {
 constexpr std::size_t gpu_pair_storage_size =
     sizeof(u128) + 2 * sizeof(u32);
 
+// At a maximum load factor of 70%, the hash table uses about
+// 45.7 bytes per pair: 16 bytes for the sum, 8 for its tag, and
+// 4 each for a and b.  Round up to a conservative partitioning
+// guideline that leaves a little room for the span array.
+constexpr std::size_t gpu_hash_pair_storage_size = 48;
+constexpr u64 hash_load_numerator = 7;
+constexpr u64 hash_load_denominator = 10;
+constexpr unsigned long long hash_empty_tag = 0;
+constexpr unsigned long long hash_reserved_tag = 1;
+
 int configured_hip_device = 0;
 
 struct gpu_pair_span {
@@ -216,6 +226,44 @@ static collision_signature make_collision_signature(
     };
 }
 
+static std::vector<collision_record> make_collision_records(
+    const std::vector<gpu_collision_input>& inputs)
+{
+    std::vector<collision_record> collisions;
+    collisions.reserve(inputs.size());
+
+    for (const auto& input : inputs) {
+        collisions.push_back({
+            input.a1,
+            input.b1,
+            input.a2,
+            input.b2,
+            make_collision_signature(input)
+        });
+    }
+
+    return collisions;
+}
+
+static u64 hash_table_capacity(u64 pair_count)
+{
+    const u128 scaled =
+        u128(pair_count) * hash_load_denominator;
+
+    const u128 capacity =
+        (scaled + hash_load_numerator - 1) /
+        hash_load_numerator;
+
+    if (capacity > std::numeric_limits<u64>::max()) {
+        throw std::length_error(
+            "GPU hash-table capacity overflow");
+    }
+
+    return std::max<u64>(
+        static_cast<u64>(capacity),
+        2);
+}
+
 static std::vector<gpu_pair_span> make_pair_spans(
     const search_partition& partition)
 {
@@ -350,6 +398,255 @@ __global__ void generate_pairs_kernel(
     }
 }
 
+__device__ unsigned long long mix_hash_gpu(
+    unsigned long long value)
+{
+    value += 0x9e3779b97f4a7c15ULL;
+    value =
+        (value ^ (value >> 30)) *
+        0xbf58476d1ce4e5b9ULL;
+    value =
+        (value ^ (value >> 27)) *
+        0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+__device__ unsigned long long hash_sum_gpu(u128 sum)
+{
+    const unsigned long long low =
+        static_cast<unsigned long long>(sum);
+    const unsigned long long high =
+        static_cast<unsigned long long>(sum >> 64);
+
+    return mix_hash_gpu(
+        low ^ mix_hash_gpu(
+            high + 0x243f6a8885a308d3ULL));
+}
+
+__device__ unsigned long long hash_tag_gpu(
+    unsigned long long hash)
+{
+    return hash <= hash_reserved_tag
+        ? hash + 2
+        : hash;
+}
+
+__device__ u64 next_hash_slot_gpu(
+    u64 slot,
+    u64 capacity)
+{
+    ++slot;
+    return slot == capacity ? 0 : slot;
+}
+
+__global__ void generate_hash_table_kernel(
+    const gpu_pair_span* spans,
+    u64 table_capacity,
+    unsigned long long* tags,
+    u128* sums,
+    u32* a_values,
+    u32* b_values,
+    unsigned int* error_flag)
+{
+    const gpu_pair_span span = spans[blockIdx.x];
+    const u64 pair_count =
+        u64(span.max_b) - span.min_b + 1;
+
+    for (u64 local_index = threadIdx.x;
+         local_index < pair_count;
+         local_index += blockDim.x)
+    {
+        const u32 b =
+            span.min_b +
+            static_cast<u32>(local_index);
+        const u128 sum = add_cubes_gpu(span.a, b);
+        const unsigned long long hash =
+            hash_sum_gpu(sum);
+        const unsigned long long tag =
+            hash_tag_gpu(hash);
+        u64 slot = hash % table_capacity;
+        bool inserted = false;
+
+        for (u64 probe = 0;
+             probe < table_capacity;
+             ++probe)
+        {
+            const unsigned long long old_tag =
+                atomicCAS(
+                    tags + slot,
+                    hash_empty_tag,
+                    hash_reserved_tag);
+
+            if (old_tag == hash_empty_tag) {
+                sums[slot] = sum;
+                a_values[slot] = span.a;
+                b_values[slot] = b;
+
+                // Publish the fingerprint only after the entry data.
+                __threadfence();
+                atomicExch(tags + slot, tag);
+                inserted = true;
+                break;
+            }
+
+            // A reserved slot is treated as occupied instead of being
+            // waited on.  This avoids an intra-wavefront spinlock
+            // deadlock; the next kernel runs only after all entries
+            // have been published.
+            slot = next_hash_slot_gpu(
+                slot,
+                table_capacity);
+        }
+
+        if (!inserted)
+            atomicExch(error_flag, 1U);
+    }
+}
+
+__global__ void count_hash_collisions_kernel(
+    const unsigned long long* tags,
+    const u128* sums,
+    u64 table_capacity,
+    unsigned long long* collision_count,
+    unsigned int* error_flag)
+{
+    const u64 entry_slot =
+        u64(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+
+    if (entry_slot >= table_capacity)
+        return;
+
+    const unsigned long long entry_tag =
+        tags[entry_slot];
+
+    if (entry_tag == hash_empty_tag)
+        return;
+
+    if (entry_tag == hash_reserved_tag) {
+        atomicExch(error_flag, 1U);
+        return;
+    }
+
+    const u128 sum = sums[entry_slot];
+    u64 slot =
+        hash_sum_gpu(sum) % table_capacity;
+    unsigned long long matches = 0;
+
+    for (u64 probe = 0;
+         probe < table_capacity;
+         ++probe)
+    {
+        if (slot == entry_slot) {
+            if (matches != 0) {
+                atomicAdd(
+                    collision_count,
+                    matches);
+            }
+            return;
+        }
+
+        const unsigned long long candidate_tag =
+            tags[slot];
+
+        if (candidate_tag == hash_empty_tag ||
+            candidate_tag == hash_reserved_tag)
+        {
+            atomicExch(error_flag, 1U);
+            return;
+        }
+
+        if (candidate_tag == entry_tag &&
+            sums[slot] == sum)
+        {
+            ++matches;
+        }
+
+        slot = next_hash_slot_gpu(
+            slot,
+            table_capacity);
+    }
+
+    atomicExch(error_flag, 1U);
+}
+
+__global__ void collect_hash_collisions_kernel(
+    const unsigned long long* tags,
+    const u128* sums,
+    const u32* a_values,
+    const u32* b_values,
+    u64 table_capacity,
+    gpu_collision_input* collisions,
+    u64 collision_capacity,
+    unsigned long long* next_collision,
+    unsigned int* error_flag)
+{
+    const u64 entry_slot =
+        u64(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+
+    if (entry_slot >= table_capacity)
+        return;
+
+    const unsigned long long entry_tag =
+        tags[entry_slot];
+
+    if (entry_tag == hash_empty_tag)
+        return;
+
+    if (entry_tag == hash_reserved_tag) {
+        atomicExch(error_flag, 1U);
+        return;
+    }
+
+    const u128 sum = sums[entry_slot];
+    u64 slot =
+        hash_sum_gpu(sum) % table_capacity;
+
+    for (u64 probe = 0;
+         probe < table_capacity;
+         ++probe)
+    {
+        if (slot == entry_slot)
+            return;
+
+        const unsigned long long candidate_tag =
+            tags[slot];
+
+        if (candidate_tag == hash_empty_tag ||
+            candidate_tag == hash_reserved_tag)
+        {
+            atomicExch(error_flag, 1U);
+            return;
+        }
+
+        if (candidate_tag == entry_tag &&
+            sums[slot] == sum)
+        {
+            const unsigned long long output_index =
+                atomicAdd(next_collision, 1ULL);
+
+            if (output_index < collision_capacity) {
+                collisions[output_index] = {
+                    a_values[slot],
+                    b_values[slot],
+                    a_values[entry_slot],
+                    b_values[entry_slot]
+                };
+            }
+            else {
+                atomicExch(error_flag, 1U);
+            }
+        }
+
+        slot = next_hash_slot_gpu(
+            slot,
+            table_capacity);
+    }
+
+    atomicExch(error_flag, 1U);
+}
+
 __global__ void count_collisions_kernel(
     const u128* sums,
     u64 pair_count,
@@ -461,6 +758,18 @@ u64 gpu_pair_record_max_count() noexcept
         gpu_pair_storage_size);
 }
 
+std::size_t gpu_hash_pair_record_size() noexcept
+{
+    return gpu_hash_pair_storage_size;
+}
+
+u64 gpu_hash_pair_record_max_count() noexcept
+{
+    return static_cast<u64>(
+        std::numeric_limits<std::size_t>::max() /
+        gpu_hash_pair_storage_size);
+}
+
 void set_hip_device(int device)
 {
     if (device < 0) {
@@ -550,7 +859,8 @@ std::string hip_device_identifier(int device)
     return identifier;
 }
 
-std::vector<collision_record> search_partition_collisions_gpu(
+std::vector<collision_record>
+search_partition_collisions_gpu_radix(
     const search_partition& partition)
 {
     if (partition.pair_count == 0 ||
@@ -798,18 +1108,282 @@ std::vector<collision_record> search_partition_collisions_gpu(
             "GPU collision count changed during collection");
     }
 
-    std::vector<collision_record> collisions;
-    collisions.reserve(collision_inputs.size());
+    return make_collision_records(collision_inputs);
+}
 
-    for (const auto& input : collision_inputs) {
-        collisions.push_back({
-            input.a1,
-            input.b1,
-            input.a2,
-            input.b2,
-            make_collision_signature(input)
-        });
+std::vector<collision_record>
+search_partition_collisions_gpu_hash(
+    const search_partition& partition)
+{
+    if (partition.pair_count == 0 ||
+        partition.min_a > partition.max_a ||
+        partition.min_b > partition.max_b ||
+        partition.s_min >= partition.s_max)
+    {
+        return {};
     }
 
-    return collisions;
+    const u64 maximum_stored_value =
+        std::numeric_limits<u32>::max();
+
+    if (partition.min_a > maximum_stored_value ||
+        partition.max_a > maximum_stored_value ||
+        partition.min_b > maximum_stored_value ||
+        partition.max_b > maximum_stored_value)
+    {
+        throw std::out_of_range(
+            "a and b values must fit in uint32_t");
+    }
+
+    if (partition.pair_count >
+        gpu_hash_pair_record_max_count())
+    {
+        throw std::length_error(
+            "GPU hash partition exceeds the host size_t range");
+    }
+
+    const unsigned int threads_per_block =
+        active_device_wavefront_size();
+
+    const auto spans = make_pair_spans(partition);
+
+    if (spans.empty())
+        return {};
+
+    if (spans.size() >
+        std::numeric_limits<unsigned int>::max())
+    {
+        throw std::length_error(
+            "GPU partition has too many a spans");
+    }
+
+    const u64 table_capacity =
+        hash_table_capacity(partition.pair_count);
+
+    if (table_capacity >
+        std::numeric_limits<std::size_t>::max() /
+            sizeof(u128))
+    {
+        throw std::length_error(
+            "GPU hash table exceeds the host size_t range");
+    }
+
+    const dim3 insertion_grid(
+        static_cast<unsigned int>(spans.size()));
+    const dim3 table_grid =
+        one_dimensional_grid(
+            table_capacity,
+            threads_per_block);
+
+    device_buffer<gpu_pair_span> device_spans(
+        static_cast<u64>(spans.size()));
+    device_buffer<unsigned long long> device_tags(
+        table_capacity);
+    device_buffer<u128> device_sums(table_capacity);
+    device_buffer<u32> device_a_values(table_capacity);
+    device_buffer<u32> device_b_values(table_capacity);
+    device_buffer<unsigned long long>
+        device_collision_count(1);
+    device_buffer<unsigned int> device_error_flag(1);
+
+    const long double table_bytes =
+        static_cast<long double>(table_capacity) *
+        (sizeof(unsigned long long) + sizeof(u128) +
+         2 * sizeof(u32));
+    const double load_factor =
+        static_cast<double>(partition.pair_count) /
+        static_cast<double>(table_capacity);
+
+    std::printf(
+        "GPU hash insertion: grid=%u blocks, "
+        "block=%u threads\n"
+        "GPU hash table: pairs=%llu, slots=%llu, "
+        "load=%.2f%%, storage=%.0Lf bytes\n"
+        "GPU hash scan: grid=%u blocks, "
+        "block=%u threads\n",
+        insertion_grid.x,
+        threads_per_block,
+        (unsigned long long)partition.pair_count,
+        (unsigned long long)table_capacity,
+        100.0 * load_factor,
+        table_bytes,
+        table_grid.x,
+        threads_per_block);
+    std::fflush(stdout);
+
+    check_hip(
+        hipMemcpy(
+            device_spans.get(),
+            spans.data(),
+            spans.size() * sizeof(gpu_pair_span),
+            hipMemcpyHostToDevice),
+        "copy pair spans to GPU");
+
+    check_hip(
+        hipMemset(
+            device_tags.get(),
+            0,
+            static_cast<std::size_t>(table_capacity) *
+                sizeof(unsigned long long)),
+        "initialize GPU hash tags");
+    check_hip(
+        hipMemset(
+            device_error_flag.get(),
+            0,
+            sizeof(unsigned int)),
+        "initialize GPU hash error flag");
+
+    hipLaunchKernelGGL(
+        generate_hash_table_kernel,
+        insertion_grid,
+        dim3(threads_per_block),
+        0,
+        0,
+        device_spans.get(),
+        table_capacity,
+        device_tags.get(),
+        device_sums.get(),
+        device_a_values.get(),
+        device_b_values.get(),
+        device_error_flag.get());
+    check_hip(
+        hipGetLastError(),
+        "launch GPU hash-insertion kernel");
+
+    unsigned int error_flag = 0;
+    check_hip(
+        hipMemcpy(
+            &error_flag,
+            device_error_flag.get(),
+            sizeof(error_flag),
+            hipMemcpyDeviceToHost),
+        "copy GPU hash insertion status");
+
+    if (error_flag != 0) {
+        throw std::runtime_error(
+            "GPU hash insertion failed");
+    }
+
+    check_hip(
+        hipMemset(
+            device_collision_count.get(),
+            0,
+            sizeof(unsigned long long)),
+        "initialize GPU hash collision counter");
+
+    hipLaunchKernelGGL(
+        count_hash_collisions_kernel,
+        table_grid,
+        dim3(threads_per_block),
+        0,
+        0,
+        device_tags.get(),
+        device_sums.get(),
+        table_capacity,
+        device_collision_count.get(),
+        device_error_flag.get());
+    check_hip(
+        hipGetLastError(),
+        "launch GPU hash collision-count kernel");
+
+    unsigned long long collision_count = 0;
+    check_hip(
+        hipMemcpy(
+            &collision_count,
+            device_collision_count.get(),
+            sizeof(collision_count),
+            hipMemcpyDeviceToHost),
+        "copy GPU hash collision count");
+    check_hip(
+        hipMemcpy(
+            &error_flag,
+            device_error_flag.get(),
+            sizeof(error_flag),
+            hipMemcpyDeviceToHost),
+        "copy GPU hash scan status");
+
+    if (error_flag != 0) {
+        throw std::runtime_error(
+            "GPU hash collision scan found an invalid probe chain");
+    }
+
+    if (collision_count == 0)
+        return {};
+
+    if (collision_count >
+        std::vector<gpu_collision_input>{}.max_size())
+    {
+        throw std::length_error(
+            "GPU hash collision result is too large");
+    }
+
+    device_buffer<gpu_collision_input>
+        device_collisions(collision_count);
+
+    check_hip(
+        hipMemset(
+            device_collision_count.get(),
+            0,
+            sizeof(unsigned long long)),
+        "reset GPU hash collision counter");
+
+    hipLaunchKernelGGL(
+        collect_hash_collisions_kernel,
+        table_grid,
+        dim3(threads_per_block),
+        0,
+        0,
+        device_tags.get(),
+        device_sums.get(),
+        device_a_values.get(),
+        device_b_values.get(),
+        table_capacity,
+        device_collisions.get(),
+        collision_count,
+        device_collision_count.get(),
+        device_error_flag.get());
+    check_hip(
+        hipGetLastError(),
+        "launch GPU hash collision-collection kernel");
+
+    std::vector<gpu_collision_input> collision_inputs(
+        static_cast<std::size_t>(collision_count));
+
+    check_hip(
+        hipMemcpy(
+            collision_inputs.data(),
+            device_collisions.get(),
+            collision_inputs.size() *
+                sizeof(gpu_collision_input),
+            hipMemcpyDeviceToHost),
+        "copy hash collisions from GPU");
+
+    unsigned long long emitted_collision_count = 0;
+    check_hip(
+        hipMemcpy(
+            &emitted_collision_count,
+            device_collision_count.get(),
+            sizeof(emitted_collision_count),
+            hipMemcpyDeviceToHost),
+        "copy emitted GPU hash collision count");
+    check_hip(
+        hipMemcpy(
+            &error_flag,
+            device_error_flag.get(),
+            sizeof(error_flag),
+            hipMemcpyDeviceToHost),
+        "copy GPU hash collection status");
+
+    if (error_flag != 0) {
+        throw std::runtime_error(
+            "GPU hash collision collection found an invalid "
+            "probe chain");
+    }
+
+    if (emitted_collision_count != collision_count) {
+        throw std::runtime_error(
+            "GPU hash collision count changed during collection");
+    }
+
+    return make_collision_records(collision_inputs);
 }
