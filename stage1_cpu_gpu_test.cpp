@@ -258,27 +258,15 @@ static void run_stage1(
 static std::filesystem::path find_bucket_directory(
     const std::filesystem::path& project_directory)
 {
-    std::vector<std::filesystem::path> candidates;
+    const auto buckets = project_directory / "buckets";
 
-    for (const auto& entry :
-         std::filesystem::directory_iterator(project_directory))
-    {
-        if (!entry.is_directory())
-            continue;
-
-        const auto buckets = entry.path() / "buckets";
-
-        if (std::filesystem::is_directory(buckets))
-            candidates.push_back(buckets);
-    }
-
-    if (candidates.size() != 1) {
+    if (!std::filesystem::is_directory(buckets)) {
         throw std::runtime_error(
-            "expected exactly one hostname bucket directory beneath " +
-            project_directory.string());
+            "bucket directory does not exist: " +
+            buckets.string());
     }
 
-    return candidates.front();
+    return buckets;
 }
 
 static std::vector<std::string> bucket_filenames(

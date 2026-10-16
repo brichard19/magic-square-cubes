@@ -31,6 +31,10 @@ Collision records are distributed among binary bucket files using a hash of
 this signature. These files are intended as input to later stages of the magic
 square search.
 
+Before bucket insertion, stage 1 removes non-primitive collisions for which
+`gcd(a1, b1, a2, b2) > 1`. This eliminates collisions that are integer-scaled
+copies of a smaller collision.
+
 ## Requirements
 
 The CPU build requires:
@@ -44,18 +48,22 @@ MPI builds require an MPI implementation that provides `mpicxx` and `mpirun`
 
 ## Building
 
-Build the optimized CPU executable:
+Build the optimized CPU stage-1, HIP stage-1, and stage-2 executables:
 
 ```sh
 make
 ```
 
-This creates `magic-square-cubes-stage1`.
+This creates `magic-square-cubes-stage1`, `magic-square-cubes-stage1-hip`, and
+`magic-square-cubes-stage2`.
 
 Other build targets are:
 
 ```sh
-make debug       # CPU debug build
+make debug       # CPU stage-1 and stage-2 debug builds
+make stage1      # Optimized CPU stage-1 build
+make stage2      # Optimized stage-2 build
+make stage2-debug # Stage-2 debug build
 make mpi         # Optimized CPU + MPI build
 make mpi-debug   # CPU + MPI debug build
 make hip         # Optimized HIP build
@@ -105,7 +113,7 @@ test removes its temporary workspace after a successful comparison. It keeps
 the workspace after a failure for diagnosis; `--keep-output` also preserves a
 successful run.
 
-## Usage
+## Stage 1 usage
 
 ```text
 magic-square-cubes-stage1 -p NAME [options]
@@ -322,14 +330,13 @@ The program creates the named project directory beneath the current working
 directory. Results are written as:
 
 ```text
-<project>/<hostname>/buckets/
+<project>/buckets/
 ```
 
-There is one bucket set per project and hostname, regardless of the backend or
-the number of CPU or GPU workers. In an MPI run, rank 0 receives every
-collision list and writes the shared bucket set beneath the coordinator's
-hostname. GPU identifiers are still reported at startup for device mapping,
-but are not part of the output path.
+There is one bucket set per project, regardless of the backend or the number
+of CPU or GPU workers. In an MPI run, rank 0 receives every collision list and
+writes this shared bucket set. GPU identifiers and hostnames are not part of
+the output path.
 
 There are 32 bucket files named:
 
@@ -394,3 +401,39 @@ A forced termination such as `SIGKILL`, a machine failure, or a power loss can
 occur after bucket data is appended but before the completion record is
 written. In that case, retrying the incomplete partition can append duplicate
 collision records. Graceful `SIGINT` and `SIGTERM` shutdown avoids this window.
+
+## Stage 2 signature scan
+
+Stage 2 reads the single collision bucket set produced by the stage-1 manager
+and finds records with the same complete `(u,v)` signature. It locates the
+project's `<project>/buckets/` directory, sorts each bucket by signature, and
+scans equal-signature runs. Only one of the 32 buckets is held in memory at a
+time.
+
+Build stage 2 with:
+
+```sh
+make stage2
+```
+
+Run it against a completed stage-1 project:
+
+```sh
+./magic-square-cubes-stage2 --project example-search
+```
+
+By default, stage 2 prints the first 10 repeated signatures in each bucket,
+their group sizes, and the first three collision records in each group. It
+also prints per-bucket and overall counts. This makes unexpected signature
+collisions visible without flooding the output. To print every repeated
+signature and all of its collision records, use:
+
+```sh
+./magic-square-cubes-stage2 \
+    --project example-search \
+    --show-matches
+```
+
+The initial stage-2 implementation sorts each bucket in memory. A future
+external-sort path may be needed if a single bucket grows beyond available
+RAM.

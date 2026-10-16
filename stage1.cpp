@@ -29,6 +29,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -372,53 +373,10 @@ static u64 hash_collision_signature(
     return mix_u64(hash);
 }
 
-static std::filesystem::path project_host_directory(
-    std::string_view project_name)
-{
-    std::array<char, 256> hostname_buffer{};
-
-    if (gethostname(
-            hostname_buffer.data(),
-            hostname_buffer.size()) != 0)
-    {
-        throw std::system_error(
-            errno,
-            std::generic_category(),
-            "unable to determine hostname");
-    }
-
-    hostname_buffer.back() = '\0';
-    std::string hostname(hostname_buffer.data());
-
-    if (hostname.empty())
-        hostname = "unknown-host";
-
-    for (char& character : hostname) {
-        const bool is_letter =
-            (character >= 'a' && character <= 'z') ||
-            (character >= 'A' && character <= 'Z');
-
-        const bool is_digit =
-            character >= '0' && character <= '9';
-
-        if (!is_letter && !is_digit &&
-            character != '-' &&
-            character != '_' &&
-            character != '.')
-        {
-            character = '_';
-        }
-    }
-
-    return
-        std::filesystem::path(std::string(project_name)) /
-        hostname;
-}
-
 static std::filesystem::path collision_output_directory(
     std::string_view project_name)
 {
-    return project_host_directory(project_name) /
+    return std::filesystem::path(std::string(project_name)) /
         "buckets";
 }
 
@@ -909,9 +867,37 @@ private:
     std::mutex mutex_;
 };
 
+static std::size_t remove_nonprimitive_collisions(
+    std::vector<collision_record>& collisions)
+{
+    const std::size_t original_size = collisions.size();
+
+    collisions.erase(
+        std::remove_if(
+            collisions.begin(),
+            collisions.end(),
+            [](const collision_record& collision)
+            {
+                u32 divisor = std::gcd(
+                    collision.a1,
+                    collision.b1);
+                divisor = std::gcd(
+                    divisor,
+                    collision.a2);
+                divisor = std::gcd(
+                    divisor,
+                    collision.b2);
+                return divisor > 1;
+            }),
+        collisions.end());
+
+    return original_size - collisions.size();
+}
+
 struct partition_result {
     std::size_t partition_index = 0;
     std::vector<collision_record> collisions;
+    std::size_t removed_collision_count = 0;
 };
 
 class bounded_partition_result_queue {
@@ -1026,6 +1012,7 @@ struct mpi_partition_message {
 struct mpi_result_header {
     u64 partition_index;
     u64 collision_count;
+    u64 removed_collision_count;
     double elapsed_seconds;
 };
 
@@ -1273,6 +1260,7 @@ static void run_mpi_coordinator(
         partitions.size(), false);
     std::size_t completed_this_run_count = 0;
     u64 total_collision_count = 0;
+    u64 total_removed_collision_count = 0;
 
     while (active_workers != 0) {
         mpi_result_header header{};
@@ -1343,6 +1331,17 @@ static void run_mpi_coordinator(
         }
 
         total_collision_count += header.collision_count;
+
+        if (header.removed_collision_count >
+            std::numeric_limits<u64>::max() -
+                total_removed_collision_count)
+        {
+            throw std::overflow_error(
+                "total removed collision count overflow");
+        }
+
+        total_removed_collision_count +=
+            header.removed_collision_count;
         completed_this_run[partition_index] = true;
         ++completed_this_run_count;
 
@@ -1355,13 +1354,16 @@ static void run_mpi_coordinator(
 
         std::printf(
             "MPI worker rank %d completed partition %zu/%zu: "
-            "%llu collisions found, %.2f Mops/sec (%.3f s); "
+            "%llu primitive collisions retained, %llu "
+            "non-primitive collisions removed, %.2f Mops/sec "
+            "(%.3f s); "
             "%zu/%zu total partitions complete, "
             "%llu collisions this run\n",
             status.MPI_SOURCE,
             partition_index + 1,
             partitions.size(),
             (unsigned long long)header.collision_count,
+            (unsigned long long)header.removed_collision_count,
             operations_per_second / 1'000'000.0,
             header.elapsed_seconds,
             progress.completed_count(),
@@ -1396,9 +1398,11 @@ static void run_mpi_coordinator(
     else {
         std::printf(
             "Appended %llu collisions this run; all %zu "
-            "partitions are complete.\n",
+            "partitions are complete (%llu non-primitive "
+            "collisions removed).\n",
             (unsigned long long)total_collision_count,
-            partitions.size());
+            partitions.size(),
+            (unsigned long long)total_removed_collision_count);
     }
     std::fflush(stdout);
 }
@@ -1462,9 +1466,13 @@ static void run_mpi_worker(
             std::chrono::duration<double>(
                 search_end - search_start).count();
 
+        const std::size_t removed_collision_count =
+            remove_nonprimitive_collisions(collisions);
+
         const mpi_result_header header{
             message.partition_index,
             static_cast<u64>(collisions.size()),
+            static_cast<u64>(removed_collision_count),
             elapsed_seconds
         };
 
@@ -2600,6 +2608,7 @@ static int run_stage1(
         collision_bucket_writer collision_buckets(
             project_name);
         u64 total_collision_count = 0;
+        u64 total_removed_collision_count = 0;
 
         std::printf(
             "Collision output directory: %s\n",
@@ -2717,6 +2726,10 @@ static int run_stage1(
                                 const double million_operations_per_second =
                                     operations_per_second / 1'000'000.0;
 
+                                const std::size_t removed_collision_count =
+                                    remove_nonprimitive_collisions(
+                                        collisions);
+
                                 const std::size_t collision_count =
                                     collisions.size();
 
@@ -2727,7 +2740,8 @@ static int run_stage1(
                                     std::printf(
                                         "Worker %zu/%zu completed "
                                         "partition %zu/%zu: "
-                                        "%zu collisions found, "
+                                        "%zu primitive collisions retained, "
+                                        "%zu non-primitive collisions removed, "
                                         "%.2f Mops/sec "
                                         "(%.3f s)\n",
                                         worker_index + 1,
@@ -2735,6 +2749,7 @@ static int run_stage1(
                                         partition_index + 1,
                                         partitions.size(),
                                         collision_count,
+                                        removed_collision_count,
                                         million_operations_per_second,
                                         elapsed_seconds);
                                     std::fflush(stdout);
@@ -2742,7 +2757,8 @@ static int run_stage1(
 
                                 if (!results.push({
                                         partition_index,
-                                        std::move(collisions)}))
+                                        std::move(collisions),
+                                        removed_collision_count}))
                                 {
                                     break;
                                 }
@@ -2813,6 +2829,18 @@ static int run_stage1(
                 total_collision_count +=
                     static_cast<u64>(
                         result.collisions.size());
+
+                if (result.removed_collision_count >
+                    std::numeric_limits<u64>::max() -
+                        total_removed_collision_count)
+                {
+                    throw std::overflow_error(
+                        "total removed collision count overflow");
+                }
+
+                total_removed_collision_count +=
+                    static_cast<u64>(
+                        result.removed_collision_count);
                 ++processed_partitions;
 
                 {
@@ -2876,9 +2904,11 @@ static int run_stage1(
         else {
             std::printf(
                 "Appended %llu collisions this run; all %zu "
-                "partitions are complete.\n",
+                "partitions are complete (%llu non-primitive "
+                "collisions removed).\n",
                 (unsigned long long)total_collision_count,
-                partitions.size());
+                partitions.size(),
+                (unsigned long long)total_removed_collision_count);
         }
     }
     catch (const std::exception& error) {
