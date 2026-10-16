@@ -62,6 +62,8 @@ make hip         # Optimized HIP build
 make hip-debug   # HIP debug build
 make hip-mpi     # Optimized HIP + MPI build
 make hip-mpi-debug # HIP + MPI debug build
+make cpu-gpu-test # Build the CPU/GPU bucket comparison utility
+make test-cpu-gpu # Build and run the default CPU/GPU comparison
 make clean       # Remove generated executables
 ```
 
@@ -71,11 +73,45 @@ The CPU MPI targets create `magic-square-cubes-stage1-mpi` and
 The combined HIP and MPI targets create `magic-square-cubes-stage1-hip-mpi`
 and `magic-square-cubes-stage1-hip-mpi-debug`.
 
+## CPU/GPU bucket comparison
+
+`magic-square-cubes-stage1-cpu-gpu-test` runs the HIP-enabled stage-1 binary
+twice in a temporary directory: once with `--backend cpu` and once with
+`--backend gpu`. It then compares corresponding bucket files as unordered
+multisets of complete collision records. Record multiplicity, both `(a,b)`
+pairs, and both 128-bit signature values must match. Only the order of records
+within a bucket and the order of the two representations within a collision
+are canonicalized before comparison.
+
+Build and run the default hash-table test with:
+
+```sh
+make test-cpu-gpu
+```
+
+The default search uses `a,b = 1:2000` and a 16 MiB buffer. To specify stage-1
+options, place them after `--`:
+
+```sh
+make cpu-gpu-test hip
+
+./magic-square-cubes-stage1-cpu-gpu-test \
+    --stage1 ./magic-square-cubes-stage1-hip \
+    -- -a 1:10000 -b 1:10000 -m 64MB --gpu-method hash -d 0
+```
+
+Use `--gpu-method radix` to compare the radix implementation instead. The
+test removes its temporary workspace after a successful comparison. It keeps
+the workspace after a failure for diagnosis; `--keep-output` also preserves a
+successful run.
+
 ## Usage
 
 ```text
-magic-square-cubes-stage1 [options]
+magic-square-cubes-stage1 -p NAME [options]
 
+  -p NAME              required project/output directory name
+  --project NAME       same as -p
   -a MIN:MAX           inclusive range for a
   -b MIN:MAX           inclusive range for b
   -m SIZE              target pair-buffer size
@@ -95,6 +131,10 @@ Defaults:
 -a 1:100000 -b 2:100000 -m 1GB -j 1 -d 0 --backend cpu --gpu-method hash
 ```
 
+There is no default project name. It must be supplied for every run. Project
+names are single directory components of at most 255 characters and may
+contain letters, digits, `.`, `-`, and `_`.
+
 Buffer sizes may use `B`, `KB`, `MB`, or `GB`. These suffixes use powers of
 1024, so `1GB` means 1,073,741,824 bytes.
 
@@ -108,6 +148,7 @@ pair buffer per worker:
 
 ```sh
 ./magic-square-cubes-stage1 \
+    --project example-search \
     -a 1:50000 \
     -b 1:50000 \
     -m 1GB \
@@ -126,6 +167,7 @@ Build and run the HIP backend:
 make hip
 
 ./magic-square-cubes-stage1-hip \
+    --project example-search \
     -a 1:50000 \
     -b 1:50000 \
     -m 1GB \
@@ -162,6 +204,7 @@ processes plus the coordinator:
 make mpi
 
 mpirun -np 5 ./magic-square-cubes-stage1-mpi \
+    --project example-search \
     -a 1:50000 \
     -b 1:50000 \
     -m 1GB \
@@ -176,6 +219,7 @@ one machine:
 make hip-mpi
 
 mpirun -np 5 ./magic-square-cubes-stage1-hip-mpi \
+    --project example-search \
     -a 1:50000 \
     -b 1:50000 \
     -m 1GB \
@@ -261,6 +305,7 @@ At startup, the program reports:
 - The requested `a` and `b` ranges
 - Pair-buffer size and pair-record count
 - Every generated partition
+- The progress-file path and resume status
 - Bucket configuration and output directory
 - Active worker count
 - GPU grid and block sizes for generation and collision scanning
@@ -273,24 +318,18 @@ reported search time excludes writing collisions to bucket files.
 
 ## Collision files
 
-Results are written beneath the current directory:
+The program creates the named project directory beneath the current working
+directory. Results are written as:
 
 ```text
-<hostname>/CPU/
-<hostname>/GPU-<device-ID>/
-<hostname>/MPI-CPU/
-<hostname>/MPI-GPU/
+<project>/<hostname>/buckets/
 ```
 
-GPU directories use the 16-byte UUID reported in `hipDeviceProp_t`. AMD HIP
-commonly reports this as a printable serial number, producing a directory such
-as `GPU-295cea3615cef364`. A binary UUID is formatted as 32 hexadecimal digits.
-If the runtime reports an all-zero UUID, the program instead uses
-`GPU-pci-<domain>-<bus>-<device>`.
-
-MPI runs aggregate every worker's collisions on rank 0, so they use one
-`MPI-CPU` or `MPI-GPU` directory beneath the coordinator's hostname rather
-than a directory for each worker device.
+There is one bucket set per project and hostname, regardless of the backend or
+the number of CPU or GPU workers. In an MPI run, rank 0 receives every
+collision list and writes the shared bucket set beneath the coordinator's
+hostname. GPU identifiers are still reported at startup for device mapping,
+but are not part of the output path.
 
 There are 32 bucket files named:
 
@@ -301,8 +340,8 @@ collision-bucket-u32-v1-31.bin
 ```
 
 The files are unsorted and opened in append mode. Running the same search more
-than once in the same directory appends duplicate results unless the existing
-bucket files are moved or removed first.
+than once with the same project name resumes from the project's progress file;
+partitions already recorded as complete are not searched or appended again.
 
 Each file is a raw sequence of `collision_record` objects:
 
@@ -323,3 +362,35 @@ The current binary format is native to the compiler ABI and machine byte
 order; it has no file header or portability conversion. The executable reports
 the collision-record size at startup. Do not combine bucket files produced by
 builds with different record layouts.
+
+## Stopping and resuming
+
+Partition progress is stored in:
+
+```text
+<project>/stage1-progress-v1.bin
+```
+
+The coordinator records when each partition is distributed and when it is
+complete. A partition is recorded as complete only after its collision records
+have been flushed to the bucket files. On restart, completed partitions are
+skipped. A partition that was distributed but did not complete is searched
+again.
+
+Press Ctrl-C, or send `SIGTERM`, to request a graceful stop. The coordinator
+stops distributing new work, waits for currently active partitions, flushes
+their collision records, and checkpoints them. Run the same command again to
+continue the remaining work. MPI jobs use the same behavior: rank 0 owns the
+progress file and stops assigning work to worker ranks.
+
+The search ranges, pair-buffer target, and generated partition layout are
+included in the progress-file fingerprint. Reusing a project name with
+different search settings is rejected. The progress file belongs to the
+overall project rather than a particular host, so an MPI job can resume with
+rank 0 running on a different coordinator host while using the same shared
+project directory.
+
+A forced termination such as `SIGKILL`, a machine failure, or a power loss can
+occur after bucket data is appended but before the completion record is
+written. In that case, retrying the incomplete partition can append duplicate
+collision records. Graceful `SIGINT` and `SIGTERM` shutdown avoids this window.

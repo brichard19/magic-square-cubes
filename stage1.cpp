@@ -16,6 +16,8 @@
 #include <charconv>
 #include <chrono>
 #include <climits>
+#include <csignal>
+#include <cstring>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -23,7 +25,9 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -34,6 +38,13 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+
+static volatile std::sig_atomic_t stop_requested = 0;
+
+extern "C" void request_stop_signal_handler(int)
+{
+    stop_requested = 1;
+}
 
 #ifdef MAGIC_SQUARE_CUBES_ENABLE_MPI
 
@@ -287,12 +298,39 @@ static bool parse_hip_device(
     return true;
 }
 
+static bool valid_project_name(std::string_view name)
+{
+    if (name.empty() || name.size() > 255 ||
+        name == "." || name == "..")
+    {
+        return false;
+    }
+
+    for (const char character : name) {
+        const bool is_letter =
+            (character >= 'a' && character <= 'z') ||
+            (character >= 'A' && character <= 'Z');
+        const bool is_digit =
+            character >= '0' && character <= '9';
+
+        if (!is_letter && !is_digit &&
+            character != '-' && character != '_' &&
+            character != '.')
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static void print_usage(const char* program)
 {
     std::fprintf(
         stderr,
-        "Usage: %s [-a MIN:MAX] [-b MIN:MAX] [-m SIZE] [-j N] [-d N] "
+        "Usage: %s -p NAME [-a MIN:MAX] [-b MIN:MAX] [-m SIZE] [-j N] [-d N] "
         "[--backend cpu|gpu] [--gpu-method hash|radix]\n"
+        "  -p, --project NAME      required project/output directory name\n"
         "  -m, --buffer-size SIZE  target pair buffer size; B, KB, MB, GB use powers of 1024\n"
         "  -j, --threads N         worker threads; pair buffer applies to each worker\n"
         "  -d, --hip-device N      HIP device index; first local device under MPI\n"
@@ -334,8 +372,8 @@ static u64 hash_collision_signature(
     return mix_u64(hash);
 }
 
-static std::filesystem::path collision_output_directory(
-    std::string_view backend_directory)
+static std::filesystem::path project_host_directory(
+    std::string_view project_name)
 {
     std::array<char, 256> hostname_buffer{};
 
@@ -373,8 +411,15 @@ static std::filesystem::path collision_output_directory(
     }
 
     return
-        std::filesystem::path(hostname) /
-        backend_directory;
+        std::filesystem::path(std::string(project_name)) /
+        hostname;
+}
+
+static std::filesystem::path collision_output_directory(
+    std::string_view project_name)
+{
+    return project_host_directory(project_name) /
+        "buckets";
 }
 
 class collision_bucket_writer {
@@ -386,10 +431,10 @@ public:
         bucket_size_bytes / sizeof(collision_record);
 
     explicit collision_bucket_writer(
-        std::string_view backend_directory)
+        std::string_view project_name)
         : output_directory_(
             collision_output_directory(
-                backend_directory))
+                project_name))
     {
         static_assert(records_per_bucket > 0);
         static_assert(
@@ -491,6 +536,377 @@ private:
         bucket_count> buckets_;
 
     std::array<std::ofstream, bucket_count> files_;
+};
+
+struct progress_fingerprint {
+    u64 first;
+    u64 second;
+};
+
+static progress_fingerprint make_progress_fingerprint(
+    const std::vector<search_partition>& partitions,
+    u64 min_a,
+    u64 min_b,
+    u64 max_a,
+    u64 max_b,
+    u64 target_pair_records)
+{
+    u64 first = 0x6a09e667f3bcc909ULL;
+    u64 second = 0xbb67ae8584caa73bULL;
+
+    const auto add = [&](u64 value) {
+        first = mix_u64(first ^ mix_u64(value));
+        second = mix_u64(
+            second ^ mix_u64(
+                value + 0x9e3779b97f4a7c15ULL));
+    };
+
+    add(min_a);
+    add(min_b);
+    add(max_a);
+    add(max_b);
+    add(target_pair_records);
+    add(static_cast<u64>(partitions.size()));
+
+    for (const auto& partition : partitions) {
+        add(partition.min_a);
+        add(partition.min_b);
+        add(partition.max_a);
+        add(partition.max_b);
+        add(static_cast<u64>(partition.s_min));
+        add(static_cast<u64>(partition.s_min >> 64));
+        add(static_cast<u64>(partition.s_max));
+        add(static_cast<u64>(partition.s_max >> 64));
+        add(partition.pair_count);
+    }
+
+    return {first, second};
+}
+
+class partition_progress {
+public:
+    partition_progress(
+        std::string_view project_name,
+        const std::vector<search_partition>& partitions,
+        progress_fingerprint fingerprint)
+        : path_(
+            std::filesystem::path(std::string(project_name)) /
+            "stage1-progress-v1.bin"),
+          distributed_(partitions.size(), false),
+          completed_(partitions.size(), false)
+    {
+        static_assert(
+            std::is_trivially_copyable_v<file_header>);
+        static_assert(
+            std::is_trivially_copyable_v<event_record>);
+
+        std::filesystem::create_directories(
+            path_.parent_path());
+
+        const file_header expected_header =
+            make_header(partitions.size(), fingerprint);
+
+        if (std::filesystem::exists(path_)) {
+            load(expected_header);
+        }
+        else {
+            create(expected_header);
+        }
+
+        descriptor_ = ::open(
+            path_.c_str(),
+            O_WRONLY | O_APPEND);
+
+        if (descriptor_ < 0) {
+            throw std::system_error(
+                errno,
+                std::generic_category(),
+                "unable to open progress file " +
+                    path_.string());
+        }
+    }
+
+    ~partition_progress()
+    {
+        if (descriptor_ >= 0)
+            (void)::close(descriptor_);
+    }
+
+    partition_progress(const partition_progress&) = delete;
+    partition_progress& operator=(
+        const partition_progress&) = delete;
+
+    std::vector<std::size_t> pending_indices() const
+    {
+        std::vector<std::size_t> pending;
+        pending.reserve(
+            completed_.size() - completed_count_);
+
+        for (std::size_t i = 0;
+             i < completed_.size();
+             ++i)
+        {
+            if (!completed_[i])
+                pending.push_back(i);
+        }
+
+        return pending;
+    }
+
+    std::size_t completed_count() const noexcept
+    {
+        return completed_count_;
+    }
+
+    std::size_t incomplete_distributed_count() const noexcept
+    {
+        std::size_t count = 0;
+
+        for (std::size_t i = 0;
+             i < distributed_.size();
+             ++i)
+        {
+            if (distributed_[i] && !completed_[i])
+                ++count;
+        }
+
+        return count;
+    }
+
+    const std::filesystem::path& path() const noexcept
+    {
+        return path_;
+    }
+
+    void record_distributed(std::size_t partition_index)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        check_index(partition_index);
+
+        if (completed_[partition_index] ||
+            distributed_[partition_index])
+        {
+            return;
+        }
+
+        append_event({
+            static_cast<u64>(partition_index),
+            event_distributed,
+            0
+        });
+        distributed_[partition_index] = true;
+    }
+
+    void record_completed(std::size_t partition_index)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        check_index(partition_index);
+
+        if (completed_[partition_index])
+            return;
+
+        append_event({
+            static_cast<u64>(partition_index),
+            event_completed,
+            0
+        });
+        distributed_[partition_index] = true;
+        completed_[partition_index] = true;
+        ++completed_count_;
+    }
+
+private:
+    static constexpr std::array<char, 8> file_magic{
+        'M', 'S', 'C', 'S', '1', 'P', 'R', '1'
+    };
+    static constexpr u32 file_version = 1;
+    static constexpr u32 event_distributed = 1;
+    static constexpr u32 event_completed = 2;
+
+    struct file_header {
+        std::array<char, 8> magic;
+        u32 version;
+        u32 header_size;
+        u64 partition_count;
+        u64 fingerprint_first;
+        u64 fingerprint_second;
+    };
+
+    struct event_record {
+        u64 partition_index;
+        u32 type;
+        u32 reserved;
+    };
+
+    static file_header make_header(
+        std::size_t partition_count,
+        progress_fingerprint fingerprint)
+    {
+        if (partition_count >
+            std::numeric_limits<u64>::max())
+        {
+            throw std::length_error(
+                "too many partitions for the progress file");
+        }
+
+        return {
+            file_magic,
+            file_version,
+            static_cast<u32>(sizeof(file_header)),
+            static_cast<u64>(partition_count),
+            fingerprint.first,
+            fingerprint.second
+        };
+    }
+
+    void create(const file_header& header)
+    {
+        std::ofstream file(
+            path_,
+            std::ios::binary |
+            std::ios::trunc);
+
+        file.write(
+            reinterpret_cast<const char*>(&header),
+            sizeof(header));
+        file.flush();
+
+        if (!file) {
+            throw std::runtime_error(
+                "unable to create progress file " +
+                path_.string());
+        }
+    }
+
+    void load(const file_header& expected_header)
+    {
+        std::ifstream file(path_, std::ios::binary);
+        file_header header{};
+
+        file.read(
+            reinterpret_cast<char*>(&header),
+            sizeof(header));
+
+        if (!file ||
+            header.magic != expected_header.magic ||
+            header.version != expected_header.version ||
+            header.header_size != expected_header.header_size ||
+            header.partition_count !=
+                expected_header.partition_count ||
+            header.fingerprint_first !=
+                expected_header.fingerprint_first ||
+            header.fingerprint_second !=
+                expected_header.fingerprint_second)
+        {
+            throw std::runtime_error(
+                "progress file does not match this search: " +
+                path_.string());
+        }
+
+        std::uintmax_t valid_size = sizeof(header);
+
+        while (true) {
+            event_record event{};
+            file.read(
+                reinterpret_cast<char*>(&event),
+                sizeof(event));
+
+            if (file.gcount() == 0)
+                break;
+
+            if (file.gcount() !=
+                static_cast<std::streamsize>(sizeof(event)))
+            {
+                file.close();
+                std::filesystem::resize_file(
+                    path_,
+                    valid_size);
+                break;
+            }
+
+            valid_size += sizeof(event);
+
+            if (event.reserved != 0 ||
+                event.partition_index >= completed_.size())
+            {
+                throw std::runtime_error(
+                    "invalid record in progress file " +
+                    path_.string());
+            }
+
+            const std::size_t index =
+                static_cast<std::size_t>(
+                    event.partition_index);
+
+            if (event.type == event_distributed) {
+                distributed_[index] = true;
+            }
+            else if (event.type == event_completed) {
+                distributed_[index] = true;
+
+                if (!completed_[index]) {
+                    completed_[index] = true;
+                    ++completed_count_;
+                }
+            }
+            else {
+                throw std::runtime_error(
+                    "unknown record in progress file " +
+                    path_.string());
+            }
+        }
+    }
+
+    void check_index(std::size_t partition_index) const
+    {
+        if (partition_index >= completed_.size()) {
+            throw std::out_of_range(
+                "partition progress index is out of range");
+        }
+    }
+
+    void append_event(const event_record& event)
+    {
+        const auto* data =
+            reinterpret_cast<const unsigned char*>(&event);
+        std::size_t remaining = sizeof(event);
+
+        while (remaining != 0) {
+            const ssize_t written = ::write(
+                descriptor_,
+                data,
+                remaining);
+
+            if (written < 0 && errno == EINTR)
+                continue;
+
+            if (written <= 0) {
+                throw std::system_error(
+                    errno,
+                    std::generic_category(),
+                    "unable to append progress file " +
+                        path_.string());
+            }
+
+            data += written;
+            remaining -= static_cast<std::size_t>(written);
+        }
+
+        if (::fsync(descriptor_) != 0) {
+            throw std::system_error(
+                errno,
+                std::generic_category(),
+                "unable to sync progress file " +
+                    path_.string());
+        }
+    }
+
+    std::filesystem::path path_;
+    std::vector<bool> distributed_;
+    std::vector<bool> completed_;
+    std::size_t completed_count_ = 0;
+    int descriptor_ = -1;
+    std::mutex mutex_;
 };
 
 struct partition_result {
@@ -792,10 +1208,12 @@ static void mpi_send_stop(int worker_rank)
 
 static void run_mpi_coordinator(
     const std::vector<search_partition>& partitions,
+    const std::vector<std::size_t>& pending_partitions,
+    partition_progress& progress,
     int world_size,
-    std::string_view backend_directory)
+    std::string_view project_name)
 {
-    if (partitions.empty()) {
+    if (pending_partitions.empty()) {
         for (int worker_rank = 1;
              worker_rank < world_size;
              ++worker_rank)
@@ -806,7 +1224,7 @@ static void run_mpi_coordinator(
     }
 
     collision_bucket_writer collision_buckets(
-        backend_directory);
+        project_name);
 
     std::printf(
         "Collision output directory: %s\n",
@@ -814,28 +1232,49 @@ static void run_mpi_coordinator(
             .string().c_str());
     std::fflush(stdout);
 
-    std::size_t next_partition = 0;
+    std::size_t next_pending_partition = 0;
+    std::size_t active_workers = 0;
+    std::vector<bool> assigned(
+        partitions.size(), false);
+
+    const auto assign_partition =
+        [&](int worker_rank)
+        {
+            const std::size_t partition_index =
+                pending_partitions[
+                    next_pending_partition++];
+
+            progress.record_distributed(
+                partition_index);
+            assigned[partition_index] = true;
+            mpi_send_partition(
+                partitions,
+                partition_index,
+                worker_rank);
+        };
 
     for (int worker_rank = 1;
          worker_rank < world_size;
          ++worker_rank)
     {
-        if (next_partition < partitions.size()) {
-            mpi_send_partition(
-                partitions,
-                next_partition++,
-                worker_rank);
+        if (!stop_requested &&
+            next_pending_partition <
+                pending_partitions.size())
+        {
+            assign_partition(worker_rank);
+            ++active_workers;
         }
         else {
             mpi_send_stop(worker_rank);
         }
     }
 
-    std::vector<bool> completed(partitions.size(), false);
-    std::size_t completed_count = 0;
+    std::vector<bool> completed_this_run(
+        partitions.size(), false);
+    std::size_t completed_this_run_count = 0;
     u64 total_collision_count = 0;
 
-    while (completed_count < partitions.size()) {
+    while (active_workers != 0) {
         mpi_result_header header{};
         MPI_Status status{};
 
@@ -854,9 +1293,12 @@ static void run_mpi_coordinator(
             static_cast<std::size_t>(
                 header.partition_index);
 
-        if (completed[partition_index]) {
+        if (!assigned[partition_index] ||
+            completed_this_run[partition_index])
+        {
             throw std::runtime_error(
-                "MPI worker returned a partition more than once");
+                "MPI worker returned an unassigned partition "
+                "or returned a partition more than once");
         }
 
         if (header.collision_count >
@@ -887,6 +1329,11 @@ static void run_mpi_coordinator(
         for (const auto& collision : collisions)
             collision_buckets.add(collision);
 
+        // A partition is checkpointed only after every bucket write
+        // for that partition has been flushed.
+        collision_buckets.flush_all();
+        progress.record_completed(partition_index);
+
         if (header.collision_count >
             std::numeric_limits<u64>::max() -
                 total_collision_count)
@@ -896,8 +1343,8 @@ static void run_mpi_coordinator(
         }
 
         total_collision_count += header.collision_count;
-        completed[partition_index] = true;
-        ++completed_count;
+        completed_this_run[partition_index] = true;
+        ++completed_this_run_count;
 
         const double operations_per_second =
             header.elapsed_seconds > 0.0
@@ -909,35 +1356,50 @@ static void run_mpi_coordinator(
         std::printf(
             "MPI worker rank %d completed partition %zu/%zu: "
             "%llu collisions found, %.2f Mops/sec (%.3f s); "
-            "%zu/%zu partitions bucketed, %llu collisions total\n",
+            "%zu/%zu total partitions complete, "
+            "%llu collisions this run\n",
             status.MPI_SOURCE,
             partition_index + 1,
             partitions.size(),
             (unsigned long long)header.collision_count,
             operations_per_second / 1'000'000.0,
             header.elapsed_seconds,
-            completed_count,
+            progress.completed_count(),
             partitions.size(),
             (unsigned long long)total_collision_count);
         std::fflush(stdout);
 
-        if (next_partition < partitions.size()) {
-            mpi_send_partition(
-                partitions,
-                next_partition++,
-                status.MPI_SOURCE);
+        if (!stop_requested &&
+            next_pending_partition <
+                pending_partitions.size())
+        {
+            assign_partition(status.MPI_SOURCE);
         }
         else {
             mpi_send_stop(status.MPI_SOURCE);
+            --active_workers;
         }
     }
 
     collision_buckets.flush_all();
 
-    std::printf(
-        "Appended %llu collisions from all partitions "
-        "to the bucket files.\n",
-        (unsigned long long)total_collision_count);
+    if (stop_requested &&
+        progress.completed_count() < partitions.size())
+    {
+        std::printf(
+            "Stop requested. Checkpointed %zu partitions this "
+            "run; %zu/%zu total partitions are complete.\n",
+            completed_this_run_count,
+            progress.completed_count(),
+            partitions.size());
+    }
+    else {
+        std::printf(
+            "Appended %llu collisions this run; all %zu "
+            "partitions are complete.\n",
+            (unsigned long long)total_collision_count,
+            partitions.size());
+    }
     std::fflush(stdout);
 }
 
@@ -1562,6 +2024,7 @@ static int run_stage1(
     int requested_hip_device = 0;
     bool use_gpu = false;
     bool use_gpu_hash_table = true;
+    std::string project_name;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view option = argv[i];
@@ -1593,12 +2056,17 @@ static int run_stage1(
         const bool is_gpu_method_option =
             option == "--gpu-method";
 
+        const bool is_project_option =
+            option == "-p" ||
+            option == "--project";
+
         if (!is_range_option &&
             !is_buffer_option &&
             !is_thread_option &&
             !is_backend_option &&
             !is_hip_device_option &&
-            !is_gpu_method_option)
+            !is_gpu_method_option &&
+            !is_project_option)
         {
             std::fprintf(
                 stderr,
@@ -1618,6 +2086,23 @@ static int run_stage1(
         }
 
         const char* const value = argv[++i];
+
+        if (is_project_option) {
+            if (!valid_project_name(value)) {
+                std::fprintf(
+                    stderr,
+                    "Invalid project name: %s\n"
+                    "Project names may contain only letters, "
+                    "digits, '.', '-', and '_', and must be at "
+                    "most 255 characters.\n",
+                    value);
+                print_usage(argv[0]);
+                return 1;
+            }
+
+            project_name = value;
+            continue;
+        }
 
         if (is_backend_option) {
             const std::string_view backend = value;
@@ -1724,6 +2209,16 @@ static int run_stage1(
         }
     }
 
+    if (project_name.empty()) {
+        if (coordinator) {
+            std::fprintf(
+                stderr,
+                "A project name is required.\n");
+            print_usage(argv[0]);
+        }
+        return 1;
+    }
+
     if (min_a == 0 || min_b == 0) {
         std::fprintf(
             stderr,
@@ -1746,7 +2241,6 @@ static int run_stage1(
     }
 
     const char* backend_name = "CPU";
-    std::string backend_directory = "CPU";
     std::string device_identifier;
     partition_search_function* search_backend_function =
         search_partition_collisions_cpu;
@@ -1781,17 +2275,12 @@ static int run_stage1(
                 ? gpu_hash_pair_record_max_count()
                 : gpu_pair_record_max_count();
 
-        if (distributed && coordinator) {
-            backend_directory = "MPI-GPU";
-        }
-        else {
+        if (!distributed || !coordinator) {
             try {
                 set_hip_device(effective_hip_device);
                 device_identifier =
                     hip_device_identifier(
                         effective_hip_device);
-                backend_directory =
-                    "GPU-" + device_identifier;
             }
             catch (const std::exception& error) {
                 std::fprintf(
@@ -1819,9 +2308,6 @@ static int run_stage1(
         return 1;
 #endif
     }
-    else if (distributed) {
-        backend_directory = "MPI-CPU";
-    }
 
     const u64 target_pair_records =
         buffer_size_bytes / pair_record_size;
@@ -1845,6 +2331,35 @@ static int run_stage1(
     }
 
     if (coordinator) {
+        try {
+            std::filesystem::create_directories(
+                std::filesystem::path(project_name));
+        }
+        catch (const std::exception& error) {
+            std::fprintf(
+                stderr,
+                "Unable to create project directory '%s': %s\n",
+                project_name.c_str(),
+                error.what());
+#ifdef MAGIC_SQUARE_CUBES_ENABLE_MPI
+            if (distributed)
+                (void)MPI_Abort(MPI_COMM_WORLD, 1);
+#endif
+            return 1;
+        }
+    }
+
+    (void)std::signal(
+        SIGINT,
+        request_stop_signal_handler);
+    (void)std::signal(
+        SIGTERM,
+        request_stop_signal_handler);
+
+    if (coordinator) {
+        std::printf(
+            "Project: %s\n",
+            project_name.c_str());
         std::printf(
             "Search backend: %s%s\n",
             backend_name,
@@ -1962,14 +2477,68 @@ static int run_stage1(
         }
     }
 
+    std::unique_ptr<partition_progress> progress;
+    std::vector<std::size_t> pending_partitions;
+
+    if (coordinator) {
+        try {
+            progress = std::make_unique<partition_progress>(
+                project_name,
+                partitions,
+                make_progress_fingerprint(
+                    partitions,
+                    min_a,
+                    min_b,
+                    max_a,
+                    max_b,
+                    target_pair_records));
+            pending_partitions =
+                progress->pending_indices();
+
+            std::printf(
+                "Progress file: %s\n"
+                "Resume status: %zu/%zu partitions complete, "
+                "%zu pending",
+                progress->path().string().c_str(),
+                progress->completed_count(),
+                partitions.size(),
+                pending_partitions.size());
+
+            const std::size_t previously_distributed =
+                progress->incomplete_distributed_count();
+
+            if (previously_distributed != 0) {
+                std::printf(
+                    " (%zu previously distributed but incomplete)",
+                    previously_distributed);
+            }
+
+            std::printf(".\n");
+            std::fflush(stdout);
+        }
+        catch (const std::exception& error) {
+            std::fprintf(
+                stderr,
+                "Unable to initialize partition progress: %s\n",
+                error.what());
+#ifdef MAGIC_SQUARE_CUBES_ENABLE_MPI
+            if (distributed)
+                (void)MPI_Abort(MPI_COMM_WORLD, 1);
+#endif
+            return 1;
+        }
+    }
+
 #ifdef MAGIC_SQUARE_CUBES_ENABLE_MPI
     if (distributed) {
         try {
             if (coordinator) {
                 run_mpi_coordinator(
                     partitions,
+                    pending_partitions,
+                    *progress,
                     mpi_size,
-                    backend_directory);
+                    project_name);
             }
             else {
                 run_mpi_worker(
@@ -1995,8 +2564,14 @@ static int run_stage1(
     }
 #endif
 
-    if (partitions.empty())
+    if (pending_partitions.empty()) {
+        if (!partitions.empty()) {
+            std::printf(
+                "All partitions were already completed; "
+                "nothing to do.\n");
+        }
         return 0;
+    }
 
     const std::size_t backend_worker_count =
         use_gpu ? 1 : requested_thread_count;
@@ -2004,7 +2579,7 @@ static int run_stage1(
     const std::size_t worker_count =
         std::min(
             backend_worker_count,
-            partitions.size());
+            pending_partitions.size());
 
     if (use_gpu) {
         std::printf(
@@ -2023,7 +2598,7 @@ static int run_stage1(
 
     try {
         collision_bucket_writer collision_buckets(
-            backend_directory);
+            project_name);
         u64 total_collision_count = 0;
 
         std::printf(
@@ -2038,7 +2613,7 @@ static int run_stage1(
             worker_count,
             worker_count);
 
-        std::atomic<std::size_t> next_partition{0};
+        std::atomic<std::size_t> next_pending_partition{0};
         std::atomic<bool> stop_workers{false};
 
         std::mutex progress_mutex;
@@ -2077,18 +2652,25 @@ static int run_stage1(
                     {
                         try {
                             while (!stop_workers.load(
-                                std::memory_order_acquire))
+                                       std::memory_order_acquire) &&
+                                   !stop_requested)
                             {
-                                const std::size_t partition_index =
-                                    next_partition.fetch_add(
+                                const std::size_t pending_index =
+                                    next_pending_partition.fetch_add(
                                         1,
                                         std::memory_order_relaxed);
 
-                                if (partition_index >=
-                                    partitions.size())
+                                if (pending_index >=
+                                    pending_partitions.size())
                                 {
                                     break;
                                 }
+
+                                const std::size_t partition_index =
+                                    pending_partitions[pending_index];
+
+                                progress->record_distributed(
+                                    partition_index);
 
                                 const auto& partition =
                                     partitions[partition_index];
@@ -2214,6 +2796,12 @@ static int run_stage1(
                     collision_buckets.add(collision);
                 }
 
+                // Do not mark the partition complete until its bucket
+                // records have been flushed.
+                collision_buckets.flush_all();
+                progress->record_completed(
+                    result.partition_index);
+
                 if (result.collisions.size() >
                     std::numeric_limits<u64>::max() -
                         total_collision_count)
@@ -2266,17 +2854,32 @@ static int run_stage1(
                 std::rethrow_exception(worker_error);
         }
 
-        if (processed_partitions != partitions.size()) {
+        if (!stop_requested &&
+            processed_partitions != pending_partitions.size())
+        {
             throw std::runtime_error(
                 "not all partitions produced a result");
         }
 
         collision_buckets.flush_all();
 
-        std::printf(
-            "Appended %llu collisions from all partitions "
-            "to the bucket files.\n",
-            (unsigned long long)total_collision_count);
+        if (stop_requested &&
+            progress->completed_count() < partitions.size())
+        {
+            std::printf(
+                "Stop requested. Checkpointed %zu partitions this "
+                "run; %zu/%zu total partitions are complete.\n",
+                processed_partitions,
+                progress->completed_count(),
+                partitions.size());
+        }
+        else {
+            std::printf(
+                "Appended %llu collisions this run; all %zu "
+                "partitions are complete.\n",
+                (unsigned long long)total_collision_count,
+                partitions.size());
+        }
     }
     catch (const std::exception& error) {
         std::fprintf(
