@@ -18,14 +18,12 @@ constexpr std::size_t gpu_pair_storage_size =
     sizeof(u128) + 2 * sizeof(u32);
 
 // At a maximum load factor of 70%, the hash table uses about
-// 45.7 bytes per pair: 16 bytes for the sum, 8 for its tag, and
-// 4 each for a and b.  Round up to a conservative partitioning
-// guideline that leaves a little room for the span array.
-constexpr std::size_t gpu_hash_pair_storage_size = 48;
+// 17.1 bytes per pair: a 32-bit fingerprint and a packed 64-bit
+// (a,b) value per slot. Round up to leave room for the span array.
+constexpr std::size_t gpu_hash_pair_storage_size = 20;
 constexpr u64 hash_load_numerator = 7;
 constexpr u64 hash_load_denominator = 10;
-constexpr unsigned long long hash_empty_tag = 0;
-constexpr unsigned long long hash_reserved_tag = 1;
+constexpr unsigned int hash_empty_tag = 0;
 
 int configured_hip_device = 0;
 
@@ -34,6 +32,8 @@ struct gpu_pair_span {
     u32 min_b;
     u32 max_b;
     u64 output_offset;
+    u64 a3_low;
+    u64 a3_high;
 };
 
 struct gpu_collision_input {
@@ -44,6 +44,7 @@ struct gpu_collision_input {
 };
 
 static_assert(gpu_pair_storage_size == 24);
+static_assert(sizeof(gpu_pair_span) == 40);
 static_assert(sizeof(gpu_collision_input) == 16);
 
 static void check_hip(
@@ -325,7 +326,9 @@ static std::vector<gpu_pair_span> make_pair_spans(
             static_cast<u32>(a),
             static_cast<u32>(first_b),
             static_cast<u32>(last_b),
-            output_offset
+            output_offset,
+            static_cast<u64>(a3),
+            static_cast<u64>(a3 >> 64)
         });
 
         output_offset += pair_count;
@@ -360,14 +363,16 @@ static dim3 one_dimensional_grid(
 
 __device__ u128 cube_gpu(u32 x)
 {
-    return u128(x) * x * x;
+    const u64 square = u64(x) * x;
+    return u128(square) * x;
 }
 
-__device__ u128 add_cubes_gpu(
-    u32 a,
-    u32 b)
+__device__ u128 span_a_cube_gpu(
+    const gpu_pair_span& span)
 {
-    return cube_gpu(a) + cube_gpu(b);
+    return
+        (u128(span.a3_high) << 64) |
+        span.a3_low;
 }
 
 __global__ void generate_pairs_kernel(
@@ -379,6 +384,7 @@ __global__ void generate_pairs_kernel(
     const gpu_pair_span span = spans[blockIdx.x];
     const u64 pair_count =
         u64(span.max_b) - span.min_b + 1;
+    const u128 a3 = span_a_cube_gpu(span);
 
     for (u64 local_index = threadIdx.x;
          local_index < pair_count;
@@ -392,7 +398,7 @@ __global__ void generate_pairs_kernel(
             span.output_offset + local_index;
 
         sums[output_index] =
-            add_cubes_gpu(span.a, b);
+            a3 + cube_gpu(b);
         a_values[output_index] = span.a;
         b_values[output_index] = b;
     }
@@ -423,12 +429,48 @@ __device__ unsigned long long hash_sum_gpu(u128 sum)
             high + 0x243f6a8885a308d3ULL));
 }
 
-__device__ unsigned long long hash_tag_gpu(
+__device__ unsigned int hash_tag_gpu(
     unsigned long long hash)
 {
-    return hash <= hash_reserved_tag
-        ? hash + 2
-        : hash;
+    const unsigned int fingerprint =
+        static_cast<unsigned int>(hash ^ (hash >> 32));
+
+    return fingerprint == hash_empty_tag
+        ? 1U
+        : fingerprint;
+}
+
+__device__ unsigned long long pack_pair_gpu(u32 a, u32 b)
+{
+    return
+        (static_cast<unsigned long long>(a) << 32) |
+        b;
+}
+
+__device__ u32 unpack_a_gpu(unsigned long long pair)
+{
+    return static_cast<u32>(pair >> 32);
+}
+
+__device__ u32 unpack_b_gpu(unsigned long long pair)
+{
+    return static_cast<u32>(pair);
+}
+
+__device__ u128 pair_sum_gpu(unsigned long long pair)
+{
+    return
+        cube_gpu(unpack_a_gpu(pair)) +
+        cube_gpu(unpack_b_gpu(pair));
+}
+
+__device__ u64 initial_hash_slot_gpu(
+    unsigned long long hash,
+    u64 capacity)
+{
+    // Lemire's multiply-high range reduction maps a uniformly mixed
+    // 64-bit hash into [0, capacity) without an integer remainder.
+    return __umul64hi(hash, capacity);
 }
 
 __device__ u64 next_hash_slot_gpu(
@@ -442,15 +484,14 @@ __device__ u64 next_hash_slot_gpu(
 __global__ void generate_hash_table_kernel(
     const gpu_pair_span* spans,
     u64 table_capacity,
-    unsigned long long* tags,
-    u128* sums,
-    u32* a_values,
-    u32* b_values,
+    unsigned int* tags,
+    unsigned long long* pairs,
     unsigned int* error_flag)
 {
     const gpu_pair_span span = spans[blockIdx.x];
     const u64 pair_count =
         u64(span.max_b) - span.min_b + 1;
+    const u128 a3 = span_a_cube_gpu(span);
 
     for (u64 local_index = threadIdx.x;
          local_index < pair_count;
@@ -459,40 +500,38 @@ __global__ void generate_hash_table_kernel(
         const u32 b =
             span.min_b +
             static_cast<u32>(local_index);
-        const u128 sum = add_cubes_gpu(span.a, b);
+        const u128 sum = a3 + cube_gpu(b);
         const unsigned long long hash =
             hash_sum_gpu(sum);
-        const unsigned long long tag =
+        const unsigned int tag =
             hash_tag_gpu(hash);
-        u64 slot = hash % table_capacity;
+        const unsigned long long pair =
+            pack_pair_gpu(span.a, b);
+        u64 slot = initial_hash_slot_gpu(
+            hash,
+            table_capacity);
         bool inserted = false;
 
         for (u64 probe = 0;
              probe < table_capacity;
              ++probe)
         {
-            const unsigned long long old_tag =
+            const unsigned int old_tag =
                 atomicCAS(
                     tags + slot,
                     hash_empty_tag,
-                    hash_reserved_tag);
+                    tag);
 
             if (old_tag == hash_empty_tag) {
-                sums[slot] = sum;
-                a_values[slot] = span.a;
-                b_values[slot] = b;
-
-                // Publish the fingerprint only after the entry data.
-                __threadfence();
-                atomicExch(tags + slot, tag);
+                pairs[slot] = pair;
                 inserted = true;
                 break;
             }
 
-            // A reserved slot is treated as occupied instead of being
-            // waited on.  This avoids an intra-wavefront spinlock
-            // deadlock; the next kernel runs only after all entries
-            // have been published.
+            // The insertion kernel only claims slots; it never reads
+            // another entry's data. The later scan kernel runs after
+            // insertion has completed, so the successful CAS can write
+            // the final tag directly without a second atomic or fence.
             slot = next_hash_slot_gpu(
                 slot,
                 table_capacity);
@@ -504,8 +543,8 @@ __global__ void generate_hash_table_kernel(
 }
 
 __global__ void count_hash_collisions_kernel(
-    const unsigned long long* tags,
-    const u128* sums,
+    const unsigned int* tags,
+    const unsigned long long* pairs,
     u64 table_capacity,
     unsigned long long* collision_count,
     unsigned int* error_flag)
@@ -517,20 +556,17 @@ __global__ void count_hash_collisions_kernel(
     if (entry_slot >= table_capacity)
         return;
 
-    const unsigned long long entry_tag =
+    const unsigned int entry_tag =
         tags[entry_slot];
 
     if (entry_tag == hash_empty_tag)
         return;
 
-    if (entry_tag == hash_reserved_tag) {
-        atomicExch(error_flag, 1U);
-        return;
-    }
-
-    const u128 sum = sums[entry_slot];
+    const u128 sum = pair_sum_gpu(pairs[entry_slot]);
     u64 slot =
-        hash_sum_gpu(sum) % table_capacity;
+        initial_hash_slot_gpu(
+            hash_sum_gpu(sum),
+            table_capacity);
     unsigned long long matches = 0;
 
     for (u64 probe = 0;
@@ -546,18 +582,16 @@ __global__ void count_hash_collisions_kernel(
             return;
         }
 
-        const unsigned long long candidate_tag =
+        const unsigned int candidate_tag =
             tags[slot];
 
-        if (candidate_tag == hash_empty_tag ||
-            candidate_tag == hash_reserved_tag)
-        {
+        if (candidate_tag == hash_empty_tag) {
             atomicExch(error_flag, 1U);
             return;
         }
 
         if (candidate_tag == entry_tag &&
-            sums[slot] == sum)
+            pair_sum_gpu(pairs[slot]) == sum)
         {
             ++matches;
         }
@@ -571,10 +605,8 @@ __global__ void count_hash_collisions_kernel(
 }
 
 __global__ void collect_hash_collisions_kernel(
-    const unsigned long long* tags,
-    const u128* sums,
-    const u32* a_values,
-    const u32* b_values,
+    const unsigned int* tags,
+    const unsigned long long* pairs,
     u64 table_capacity,
     gpu_collision_input* collisions,
     u64 collision_capacity,
@@ -588,20 +620,19 @@ __global__ void collect_hash_collisions_kernel(
     if (entry_slot >= table_capacity)
         return;
 
-    const unsigned long long entry_tag =
+    const unsigned int entry_tag =
         tags[entry_slot];
 
     if (entry_tag == hash_empty_tag)
         return;
 
-    if (entry_tag == hash_reserved_tag) {
-        atomicExch(error_flag, 1U);
-        return;
-    }
-
-    const u128 sum = sums[entry_slot];
+    const unsigned long long entry_pair =
+        pairs[entry_slot];
+    const u128 sum = pair_sum_gpu(entry_pair);
     u64 slot =
-        hash_sum_gpu(sum) % table_capacity;
+        initial_hash_slot_gpu(
+            hash_sum_gpu(sum),
+            table_capacity);
 
     for (u64 probe = 0;
          probe < table_capacity;
@@ -610,28 +641,28 @@ __global__ void collect_hash_collisions_kernel(
         if (slot == entry_slot)
             return;
 
-        const unsigned long long candidate_tag =
+        const unsigned int candidate_tag =
             tags[slot];
 
-        if (candidate_tag == hash_empty_tag ||
-            candidate_tag == hash_reserved_tag)
-        {
+        if (candidate_tag == hash_empty_tag) {
             atomicExch(error_flag, 1U);
             return;
         }
 
+        const unsigned long long candidate_pair =
+            pairs[slot];
+
         if (candidate_tag == entry_tag &&
-            sums[slot] == sum)
-        {
+            pair_sum_gpu(candidate_pair) == sum) {
             const unsigned long long output_index =
                 atomicAdd(next_collision, 1ULL);
 
             if (output_index < collision_capacity) {
                 collisions[output_index] = {
-                    a_values[slot],
-                    b_values[slot],
-                    a_values[entry_slot],
-                    b_values[entry_slot]
+                    unpack_a_gpu(candidate_pair),
+                    unpack_b_gpu(candidate_pair),
+                    unpack_a_gpu(entry_pair),
+                    unpack_b_gpu(entry_pair)
                 };
             }
             else {
@@ -1177,19 +1208,18 @@ search_partition_collisions_gpu_hash(
 
     device_buffer<gpu_pair_span> device_spans(
         static_cast<u64>(spans.size()));
-    device_buffer<unsigned long long> device_tags(
+    device_buffer<unsigned int> device_tags(
         table_capacity);
-    device_buffer<u128> device_sums(table_capacity);
-    device_buffer<u32> device_a_values(table_capacity);
-    device_buffer<u32> device_b_values(table_capacity);
+    device_buffer<unsigned long long> device_pairs(
+        table_capacity);
     device_buffer<unsigned long long>
         device_collision_count(1);
     device_buffer<unsigned int> device_error_flag(1);
 
     const long double table_bytes =
         static_cast<long double>(table_capacity) *
-        (sizeof(unsigned long long) + sizeof(u128) +
-         2 * sizeof(u32));
+        (sizeof(unsigned int) +
+         sizeof(unsigned long long));
     const double load_factor =
         static_cast<double>(partition.pair_count) /
         static_cast<double>(table_capacity);
@@ -1224,7 +1254,7 @@ search_partition_collisions_gpu_hash(
             device_tags.get(),
             0,
             static_cast<std::size_t>(table_capacity) *
-                sizeof(unsigned long long)),
+                sizeof(unsigned int)),
         "initialize GPU hash tags");
     check_hip(
         hipMemset(
@@ -1242,9 +1272,7 @@ search_partition_collisions_gpu_hash(
         device_spans.get(),
         table_capacity,
         device_tags.get(),
-        device_sums.get(),
-        device_a_values.get(),
-        device_b_values.get(),
+        device_pairs.get(),
         device_error_flag.get());
     check_hip(
         hipGetLastError(),
@@ -1278,7 +1306,7 @@ search_partition_collisions_gpu_hash(
         0,
         0,
         device_tags.get(),
-        device_sums.get(),
+        device_pairs.get(),
         table_capacity,
         device_collision_count.get(),
         device_error_flag.get());
@@ -1334,9 +1362,7 @@ search_partition_collisions_gpu_hash(
         0,
         0,
         device_tags.get(),
-        device_sums.get(),
-        device_a_values.get(),
-        device_b_values.get(),
+        device_pairs.get(),
         table_capacity,
         device_collisions.get(),
         collision_count,
