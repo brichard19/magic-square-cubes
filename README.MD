@@ -261,17 +261,20 @@ s_min <= a^3 + b^3 < s_max
 
 The program may allow a partition to exceed the target when it cannot be split
 without dividing an equal-sum group. On the CPU, the buffer target applies to
-each active worker.
+each active worker. Startup samples the sum distribution to create partition
+boundaries. Exact bounds and pair counts are calculated when a worker receives
+a partition, allowing computation to begin without first analyzing every
+partition serially. MPI workers perform this preparation in parallel.
 
 With `--gpu-method hash`, the HIP backend performs these stages for every
 partition:
 
-1. The CPU calculates each valid `[a, b0..bN]` span.
+1. The CPU calculates the exact pair count and each valid `[a, b0..bN]` span.
 2. One GPU thread block processes each span and inserts its pairs into an
    open-addressed table with a maximum load factor of 70%.
-3. A 64-bit atomic tag claims each slot. The full unsigned 128-bit sum remains
-   in the table and is always compared before reporting a collision, so tag
-   collisions do not affect correctness.
+3. A 32-bit atomic fingerprint claims each slot, and `(a,b)` is stored as one
+   packed 64-bit value. Collision scans reconstruct and compare the full
+   unsigned 128-bit sums, so fingerprint collisions do not affect correctness.
 4. GPU kernels first count and then collect equal-sum pairs by scanning probe
    chains. Every pair is retained in the table, so a sum with more than two
    representations produces every pairwise collision.
@@ -279,9 +282,9 @@ partition:
    signatures are calculated.
 
 The count pass determines the exact collision-buffer size; no maximum
-collision estimate is required. Hash-table partitioning budgets 48 bytes per
-input pair. The allocated structure-of-arrays table uses 32 bytes per slot and
-has approximately 10 slots for every 7 pairs.
+collision estimate is required. Hash-table partitioning budgets 20 bytes per
+input pair. The allocated table uses 12 bytes per slot and has approximately
+10 slots for every 7 pairs.
 
 With `--gpu-method radix`, the HIP backend performs these stages:
 
@@ -312,7 +315,8 @@ At startup, the program reports:
 - The selected backend
 - The requested `a` and `b` ranges
 - Pair-buffer size and pair-record count
-- Every generated partition
+- Partition-planning stages, percentages, and elapsed time
+- A preview of the generated partitions
 - The progress-file path and resume status
 - Bucket configuration and output directory
 - Active worker count

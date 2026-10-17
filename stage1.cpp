@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <fstream>
 #include <fcntl.h>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -142,6 +143,62 @@ struct partition_stats {
     u64 max_a = 0;
     u64 max_b = 0;
     u64 pair_count = 0;
+};
+
+using partition_preparation_progress =
+    std::function<void(unsigned int)>;
+
+static search_partition materialize_partition(
+    const search_partition& planned_partition,
+    const partition_preparation_progress& progress = {});
+
+class coarse_progress_reporter {
+public:
+    coarse_progress_reporter(
+        const char* phase,
+        u64 total)
+        : phase_(phase), total_(total)
+    {
+        update_threshold();
+    }
+
+    void update(u64 completed)
+    {
+        if (total_ < 10 || next_percent_ > 100 ||
+            completed < next_completed_)
+        {
+            return;
+        }
+
+        std::printf(
+            "%s: %u%% (%llu/%llu)\n",
+            phase_,
+            next_percent_,
+            (unsigned long long)completed,
+            (unsigned long long)total_);
+        std::fflush(stdout);
+
+        next_percent_ += 10;
+        update_threshold();
+    }
+
+private:
+    void update_threshold()
+    {
+        if (next_percent_ > 100 || total_ == 0) {
+            next_completed_ =
+                std::numeric_limits<u64>::max();
+            return;
+        }
+
+        next_completed_ = static_cast<u64>(
+            (u128(total_) * next_percent_ + 99) / 100);
+    }
+
+    const char* phase_;
+    u64 total_;
+    unsigned int next_percent_ = 10;
+    u64 next_completed_ = 0;
 };
 
 static bool parse_range(
@@ -1011,6 +1068,7 @@ struct mpi_partition_message {
 
 struct mpi_result_header {
     u64 partition_index;
+    u64 pair_count;
     u64 collision_count;
     u64 removed_collision_count;
     double elapsed_seconds;
@@ -1177,13 +1235,10 @@ static void mpi_send_partition(
         mpi_partition_tag);
 
     std::printf(
-        "Assigned partition %zu/%zu to MPI worker rank %d "
-        "(pair_count=%llu).\n",
+        "Assigned partition %zu/%zu to MPI worker rank %d.\n",
         partition_index + 1,
         partitions.size(),
-        worker_rank,
-        (unsigned long long)
-            partitions[partition_index].pair_count);
+        worker_rank);
     std::fflush(stdout);
 }
 
@@ -1348,7 +1403,7 @@ static void run_mpi_coordinator(
         const double operations_per_second =
             header.elapsed_seconds > 0.0
                 ? static_cast<double>(
-                    partitions[partition_index].pair_count) /
+                    header.pair_count) /
                     header.elapsed_seconds
                 : 0.0;
 
@@ -1441,8 +1496,40 @@ static void run_mpi_worker(
             0,
             mpi_partition_tag);
 
-        const search_partition partition =
+        const search_partition planned_partition =
             search_partition_from_mpi(message);
+
+        std::printf(
+            "MPI worker rank %d preparing partition %llu/%llu...\n",
+            world_rank,
+            (unsigned long long)message.partition_index + 1,
+            (unsigned long long)message.partition_count);
+        std::fflush(stdout);
+
+        const auto preparation_start =
+            std::chrono::steady_clock::now();
+
+        const search_partition partition =
+            materialize_partition(
+                planned_partition,
+                [&](unsigned int percent)
+                {
+                    if (std::chrono::steady_clock::now() -
+                            preparation_start <
+                        std::chrono::seconds(1))
+                    {
+                        return;
+                    }
+
+                    std::printf(
+                        "MPI worker rank %d partition %llu "
+                        "preparation: %u%%\n",
+                        world_rank,
+                        (unsigned long long)
+                            message.partition_index + 1,
+                        percent);
+                    std::fflush(stdout);
+                });
 
         std::printf(
             "MPI worker rank %d processing partition %llu/%llu "
@@ -1471,6 +1558,7 @@ static void run_mpi_worker(
 
         const mpi_result_header header{
             message.partition_index,
+            partition.pair_count,
             static_cast<u64>(collisions.size()),
             static_cast<u64>(removed_collision_count),
             elapsed_seconds
@@ -1572,17 +1660,40 @@ static u64 count_all_pairs(
     if (min_a > last_a)
         return 0;
 
-    u64 count = 0;
+    u128 count = 0;
 
-    for (u64 a = min_a; a <= last_a; ++a) {
-        const u64 first_b =
-            std::max(min_b, a + 1);
+    if (min_a < min_b) {
+        const u64 constant_end =
+            std::min(last_a, min_b - 1);
 
-        if (first_b <= max_b)
-            count += max_b - first_b + 1;
+        if (min_a <= constant_end) {
+            count +=
+                u128(constant_end - min_a + 1) *
+                (max_b - min_b + 1);
+        }
     }
 
-    return count;
+    const u64 sloped_start =
+        std::max(min_a, min_b);
+
+    if (sloped_start <= last_a) {
+        const u128 row_count =
+            last_a - sloped_start + 1;
+        const u128 a_sum =
+            (u128(sloped_start) + last_a) *
+            row_count / 2;
+
+        count +=
+            row_count * max_b -
+            a_sum;
+    }
+
+    if (count > std::numeric_limits<u64>::max()) {
+        throw std::overflow_error(
+            "pair count exceeds uint64_t");
+    }
+
+    return static_cast<u64>(count);
 }
 
 
@@ -1593,7 +1704,6 @@ static u64 count_all_pairs(
 // It does NOT affect completeness of the search.
 //
 static std::vector<u128> sample_sum_distribution(
-    const std::vector<u128>& cubes,
     u64 min_a,
     u64 min_b,
     u64 max_a,
@@ -1606,6 +1716,10 @@ static std::vector<u128> sample_sum_distribution(
 
     if (total_pairs == 0 || sample_count == 0)
         return samples;
+
+    coarse_progress_reporter progress(
+        "Sampling sum distribution",
+        sample_count);
 
     u64 a = min_a;
     u128 row_start = 0;
@@ -1639,7 +1753,7 @@ static std::vector<u128> sample_sum_distribution(
                     first_b + offset;
 
                 samples.push_back(
-                    cubes[a] + cubes[b]);
+                    cube(a) + cube(b));
 
                 break;
             }
@@ -1647,6 +1761,8 @@ static std::vector<u128> sample_sum_distribution(
             row_start += row_count;
             ++a;
         }
+
+        progress.update(i + 1);
     }
 
     return samples;
@@ -1673,13 +1789,13 @@ static std::vector<u128> sample_sum_distribution(
 // downward.
 //
 static partition_stats analyze_partition(
-    const std::vector<u128>& cubes,
     u64 global_min_a,
     u64 global_min_b,
     u64 global_max_a,
     u64 global_max_b,
     u128 s_min,
-    u128 s_max)
+    u128 s_max,
+    const partition_preparation_progress& progress)
 {
     partition_stats stats;
 
@@ -1714,8 +1830,17 @@ static partition_stats analyze_partition(
     u64 b_max_boundary = global_max_b + 1;
 
     bool found_any = false;
+    const u64 a_count =
+        last_a - global_min_a + 1;
+    unsigned int next_progress_percent =
+        a_count < 10 ? 100 : 10;
+    u64 next_progress_a = static_cast<u64>(
+        (u128(a_count) * next_progress_percent + 99) /
+        100);
 
     for (u64 a = global_min_a; a <= last_a; ++a) {
+
+        const u128 a3 = cube(a);
 
         const u64 lowest_b =
             std::max(global_min_b, a + 1);
@@ -1730,8 +1855,7 @@ static partition_stats analyze_partition(
          */
         while (
             b_min_boundary > lowest_b &&
-            cubes[a] +
-                cubes[b_min_boundary - 1] >= s_min)
+            a3 + cube(b_min_boundary - 1) >= s_min)
         {
             --b_min_boundary;
         }
@@ -1743,8 +1867,7 @@ static partition_stats analyze_partition(
          */
         while (
             b_max_boundary > lowest_b &&
-            cubes[a] +
-                cubes[b_max_boundary - 1] >= s_max)
+            a3 + cube(b_max_boundary - 1) >= s_max)
         {
             --b_max_boundary;
         }
@@ -1763,6 +1886,25 @@ static partition_stats analyze_partition(
             std::min(
                 global_max_b + 1,
                 b_max_boundary);
+
+        const u64 completed_a =
+            a - global_min_a + 1;
+
+        if (progress &&
+            next_progress_percent <= 100 &&
+            completed_a >= next_progress_a)
+        {
+            progress(next_progress_percent);
+            next_progress_percent += 10;
+
+            if (next_progress_percent <= 100) {
+                next_progress_a = static_cast<u64>(
+                    (u128(a_count) *
+                         next_progress_percent +
+                     99) /
+                    100);
+            }
+        }
 
         if (first_b >= end_b)
             continue;
@@ -1794,9 +1936,40 @@ static partition_stats analyze_partition(
                     stats.max_b,
                     end_b - 1);
         }
+
     }
 
     return stats;
+}
+
+static search_partition materialize_partition(
+    const search_partition& planned_partition,
+    const partition_preparation_progress& progress)
+{
+    const auto stats = analyze_partition(
+        planned_partition.min_a,
+        planned_partition.min_b,
+        planned_partition.max_a,
+        planned_partition.max_b,
+        planned_partition.s_min,
+        planned_partition.s_max,
+        progress);
+
+    if (stats.pair_count == 0) {
+        search_partition empty = planned_partition;
+        empty.pair_count = 0;
+        return empty;
+    }
+
+    return {
+        stats.min_a,
+        stats.min_b,
+        stats.max_a,
+        stats.max_b,
+        planned_partition.s_min,
+        planned_partition.s_max,
+        stats.pair_count
+    };
 }
 
 std::vector<search_partition> make_partitions(
@@ -1820,21 +1993,6 @@ std::vector<search_partition> make_partitions(
 
     if (max_b <= min_a)
         return {};
-
-    /*
-     * Precompute cubes.
-     *
-     * unsigned __int128 is required once the roots get large;
-     * e.g. 5,000,000^3 does not fit comfortably in the
-     * overall two-cube sum inside uint64_t.
-     */
-    const u64 max_value =
-        std::max(max_a, max_b);
-
-    std::vector<u128> cubes(max_value + 1);
-
-    for (u64 i = 0; i <= max_value; ++i)
-        cubes[i] = cube(i);
 
     const u64 total_pairs =
         count_all_pairs(
@@ -1899,12 +2057,12 @@ std::vector<search_partition> make_partitions(
      *     global_s_min <= s < global_s_max
      */
     const u128 global_s_min =
-        cubes[first_a] +
-        cubes[first_b];
+        cube(first_a) +
+        cube(first_b);
 
     const u128 global_s_max =
-        cubes[last_a] +
-        cubes[last_b] + 1;
+        cube(last_a) +
+        cube(last_b) + 1;
 
     /*
      * Estimate S quantiles using a deterministic sample.
@@ -1931,9 +2089,16 @@ std::vector<search_partition> make_partitions(
             sample_count,
             total_pairs);
 
+    std::printf(
+        "Partition planning: %llu pairs, %llu target "
+        "partitions, %llu distribution samples.\n",
+        (unsigned long long)total_pairs,
+        (unsigned long long)partition_count,
+        (unsigned long long)sample_count);
+    std::fflush(stdout);
+
     auto samples =
         sample_sum_distribution(
-            cubes,
             min_a,
             min_b,
             max_a,
@@ -1941,9 +2106,17 @@ std::vector<search_partition> make_partitions(
             total_pairs,
             sample_count);
 
+    std::printf(
+        "Sorting %zu distribution samples...\n",
+        samples.size());
+    std::fflush(stdout);
+
     std::sort(
         samples.begin(),
         samples.end());
+
+    std::printf("Distribution sample sort complete.\n");
+    std::fflush(stdout);
 
     /*
      * Build P+1 S boundaries.
@@ -1952,6 +2125,12 @@ std::vector<search_partition> make_partitions(
 
     boundaries[0] = global_s_min;
     boundaries[p] = global_s_max;
+
+    coarse_progress_reporter boundary_progress(
+        "Selecting sum boundaries",
+        partition_count > 1
+            ? partition_count - 1
+            : 0);
 
     for (std::size_t i = 1; i < p; ++i) {
 
@@ -1964,19 +2143,20 @@ std::vector<search_partition> make_partitions(
                 std::min(
                     sample_index,
                     samples.size() - 1)];
+
+        boundary_progress.update(
+            static_cast<u64>(i));
     }
 
-    /*
-     * Analyze each partition exactly.
-     *
-     * This calculates:
-     *
-     *   - effective min/max a
-     *   - effective min/max b
-     *   - exact pair_count
-     */
+    // Exact bounds and pair counts are intentionally deferred to
+    // workers. Analyzing every partition here costs O(P * (A+B))
+    // and prevents any CPU or GPU work from starting.
     std::vector<search_partition> partitions;
     partitions.reserve(p);
+
+    coarse_progress_reporter plan_progress(
+        "Building partition plan",
+        partition_count);
 
     for (std::size_t i = 0; i < p; ++i) {
 
@@ -1986,27 +2166,20 @@ std::vector<search_partition> make_partitions(
         const u128 s_max =
             boundaries[i + 1];
 
-        const auto stats =
-            analyze_partition(
-                cubes,
-                min_a,
-                min_b,
-                max_a,
-                max_b,
-                s_min,
-                s_max);
+        plan_progress.update(
+            static_cast<u64>(i + 1));
 
-        if (stats.pair_count == 0)
+        if (s_min >= s_max)
             continue;
 
         partitions.push_back({
-            stats.min_a,
-            stats.min_b,
-            stats.max_a,
-            stats.max_b,
+            min_a,
+            min_b,
+            max_a,
+            max_b,
             s_min,
             s_max,
-            stats.pair_count
+            0
         });
     }
 
@@ -2428,6 +2601,12 @@ static int run_stage1(
     std::vector<search_partition> partitions;
 
     if (coordinator) {
+        std::printf("Planning sum partitions...\n");
+        std::fflush(stdout);
+
+        const auto planning_start =
+            std::chrono::steady_clock::now();
+
         try {
             partitions =
                 make_partitions(
@@ -2448,6 +2627,17 @@ static int run_stage1(
 #endif
             return 1;
         }
+
+        const double planning_seconds =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() -
+                planning_start).count();
+
+        std::printf(
+            "Planned %zu sum partitions in %.3f s.\n",
+            partitions.size(),
+            planning_seconds);
+        std::fflush(stdout);
     }
 
     if (coordinator && partitions.empty()) {
@@ -2456,22 +2646,63 @@ static int run_stage1(
     }
 
     if (coordinator) {
-        for (std::size_t i = 0;
-             i < partitions.size();
-             ++i)
-        {
-            const auto& partition = partitions[i];
+        const auto print_partition =
+            [&](std::size_t i)
+            {
+                const auto& partition = partitions[i];
 
-            printf("Partition %zu/%zu: a[%llu, %llu], b[%llu, %llu], s[%llu, %llu), pair_count=%llu\n",
-                   i + 1,
-                   partitions.size(),
-                   (unsigned long long)partition.min_a,
-                   (unsigned long long)partition.max_a,
-                   (unsigned long long)partition.min_b,
-                   (unsigned long long)partition.max_b,
-                   (unsigned long long)partition.s_min,
-                   (unsigned long long)partition.s_max,
-                   (unsigned long long)partition.pair_count);
+                std::printf(
+                    "Partition %zu/%zu: a[%llu, %llu], "
+                    "b[%llu, %llu], s[%llu, %llu)\n",
+                    i + 1,
+                    partitions.size(),
+                    (unsigned long long)partition.min_a,
+                    (unsigned long long)partition.max_a,
+                    (unsigned long long)partition.min_b,
+                    (unsigned long long)partition.max_b,
+                    (unsigned long long)partition.s_min,
+                    (unsigned long long)partition.s_max);
+            };
+
+        constexpr std::size_t preview_count = 10;
+
+        if (partitions.size() <= preview_count) {
+            for (std::size_t i = 0;
+                 i < partitions.size();
+                 ++i)
+            {
+                print_partition(i);
+            }
+        }
+        else {
+            const std::size_t edge_count =
+                preview_count / 2;
+
+            for (std::size_t i = 0;
+                 i < edge_count;
+                 ++i)
+            {
+                print_partition(i);
+            }
+
+            std::printf(
+                "... %zu partitions omitted from startup "
+                "preview ...\n",
+                partitions.size() - 2 * edge_count);
+
+            for (std::size_t i =
+                     partitions.size() - edge_count;
+                 i < partitions.size();
+                 ++i)
+            {
+                print_partition(i);
+            }
+        }
+
+        if (!partitions.empty()) {
+            std::printf(
+                "Exact partition bounds and pair counts are "
+                "calculated by workers on assignment.\n");
         }
 
         if (!partitions.empty()) {
@@ -2681,8 +2912,50 @@ static int run_stage1(
                                 progress->record_distributed(
                                     partition_index);
 
-                                const auto& partition =
+                                const auto& planned_partition =
                                     partitions[partition_index];
+
+                                {
+                                    std::lock_guard<std::mutex> lock(
+                                        progress_mutex);
+
+                                    std::printf(
+                                        "Worker %zu/%zu preparing "
+                                        "partition %zu/%zu...\n",
+                                        worker_index + 1,
+                                        worker_count,
+                                        partition_index + 1,
+                                        partitions.size());
+                                    std::fflush(stdout);
+                                }
+
+                                const auto preparation_start =
+                                    std::chrono::steady_clock::now();
+
+                                const search_partition partition =
+                                    materialize_partition(
+                                        planned_partition,
+                                        [&](unsigned int percent)
+                                        {
+                                            if (std::chrono::steady_clock::now() -
+                                                    preparation_start <
+                                                std::chrono::seconds(1))
+                                            {
+                                                return;
+                                            }
+
+                                            std::lock_guard<std::mutex> lock(
+                                                progress_mutex);
+
+                                            std::printf(
+                                                "Worker %zu/%zu partition "
+                                                "%zu preparation: %u%%\n",
+                                                worker_index + 1,
+                                                worker_count,
+                                                partition_index + 1,
+                                                percent);
+                                            std::fflush(stdout);
+                                        });
 
                                 {
                                     std::lock_guard<std::mutex> lock(
