@@ -148,9 +148,29 @@ struct partition_stats {
 using partition_preparation_progress =
     std::function<void(unsigned int)>;
 
+struct prepared_partition_chunks {
+    std::vector<search_partition> chunks;
+    u64 pair_count = 0;
+    u64 largest_chunk_pair_count = 0;
+    bool has_indivisible_oversized_chunk = false;
+};
+
+struct partition_search_result {
+    std::vector<collision_record> collisions;
+    double elapsed_seconds = 0.0;
+};
+
 static search_partition materialize_partition(
     const search_partition& planned_partition,
     const partition_preparation_progress& progress = {});
+
+static prepared_partition_chunks split_partition_to_target(
+    const search_partition& materialized_partition,
+    u64 target_pair_records);
+
+static partition_search_result search_partition_chunks(
+    partition_search_function* search_backend_function,
+    const std::vector<search_partition>& chunks);
 
 class coarse_progress_reporter {
 public:
@@ -389,7 +409,7 @@ static void print_usage(const char* program)
         "Usage: %s -p NAME [-a MIN:MAX] [-b MIN:MAX] [-m SIZE] [-j N] [-d N] "
         "[--backend cpu|gpu] [--gpu-method hash|radix]\n"
         "  -p, --project NAME      required project/output directory name\n"
-        "  -m, --buffer-size SIZE  target pair buffer size; B, KB, MB, GB use powers of 1024\n"
+        "  -m, --buffer-size SIZE  maximum pair buffer size; B, KB, MB, GB use powers of 1024\n"
         "  -j, --threads N         worker threads; pair buffer applies to each worker\n"
         "  -d, --hip-device N      HIP device index; first local device under MPI\n"
         "      --backend TYPE      search backend: cpu or gpu\n"
@@ -1464,7 +1484,8 @@ static void run_mpi_coordinator(
 
 static void run_mpi_worker(
     partition_search_function* search_backend_function,
-    int world_rank)
+    int world_rank,
+    u64 target_pair_records)
 {
     while (true) {
         MPI_Status status{};
@@ -1531,34 +1552,57 @@ static void run_mpi_worker(
                     std::fflush(stdout);
                 });
 
+        const auto prepared =
+            split_partition_to_target(
+                partition,
+                target_pair_records);
+
+        if (prepared.chunks.size() > 1) {
+            std::printf(
+                "MPI worker rank %d split partition %llu into "
+                "%zu chunks (largest=%llu pairs, target=%llu).\n",
+                world_rank,
+                (unsigned long long)message.partition_index + 1,
+                prepared.chunks.size(),
+                (unsigned long long)
+                    prepared.largest_chunk_pair_count,
+                (unsigned long long)target_pair_records);
+        }
+
+        if (prepared.has_indivisible_oversized_chunk) {
+            std::printf(
+                "MPI worker rank %d warning: partition %llu "
+                "contains an indivisible equal-sum group larger "
+                "than the pair-buffer target.\n",
+                world_rank,
+                (unsigned long long)message.partition_index + 1);
+        }
+
         std::printf(
             "MPI worker rank %d processing partition %llu/%llu "
-            "(pair_count=%llu)...\n",
+            "(pair_count=%llu, chunks=%zu)...\n",
             world_rank,
             (unsigned long long)message.partition_index + 1,
             (unsigned long long)message.partition_count,
-            (unsigned long long)partition.pair_count);
+            (unsigned long long)prepared.pair_count,
+            prepared.chunks.size());
         std::fflush(stdout);
 
-        const auto search_start =
-            std::chrono::steady_clock::now();
+        auto search_result =
+            search_partition_chunks(
+                search_backend_function,
+                prepared.chunks);
 
-        auto collisions =
-            search_backend_function(partition);
-
-        const auto search_end =
-            std::chrono::steady_clock::now();
-
+        auto& collisions = search_result.collisions;
         const double elapsed_seconds =
-            std::chrono::duration<double>(
-                search_end - search_start).count();
+            search_result.elapsed_seconds;
 
         const std::size_t removed_collision_count =
             remove_nonprimitive_collisions(collisions);
 
         const mpi_result_header header{
             message.partition_index,
-            partition.pair_count,
+            prepared.pair_count,
             static_cast<u64>(collisions.size()),
             static_cast<u64>(removed_collision_count),
             elapsed_seconds
@@ -1970,6 +2014,122 @@ static search_partition materialize_partition(
         planned_partition.s_max,
         stats.pair_count
     };
+}
+
+static prepared_partition_chunks split_partition_to_target(
+    const search_partition& materialized_partition,
+    u64 target_pair_records)
+{
+    prepared_partition_chunks result;
+    result.pair_count = materialized_partition.pair_count;
+
+    if (materialized_partition.pair_count == 0)
+        return result;
+
+    std::vector<search_partition> pending;
+    pending.push_back(materialized_partition);
+
+    while (!pending.empty()) {
+        search_partition partition = pending.back();
+        pending.pop_back();
+
+        if (partition.pair_count == 0)
+            partition = materialize_partition(partition);
+
+        if (partition.pair_count == 0)
+            continue;
+
+        const u128 sum_width =
+            partition.s_max - partition.s_min;
+
+        if (partition.pair_count <= target_pair_records ||
+            sum_width <= 1)
+        {
+            result.largest_chunk_pair_count =
+                std::max(
+                    result.largest_chunk_pair_count,
+                    partition.pair_count);
+
+            if (partition.pair_count > target_pair_records)
+                result.has_indivisible_oversized_chunk = true;
+
+            result.chunks.push_back(partition);
+            continue;
+        }
+
+        const u128 midpoint =
+            partition.s_min + sum_width / 2;
+
+        search_partition left = partition;
+        left.s_max = midpoint;
+        left.pair_count = 0;
+
+        search_partition right = partition;
+        right.s_min = midpoint;
+        right.pair_count = 0;
+
+        // The stack is LIFO, so push the upper half first to keep
+        // the resulting chunks in ascending S order.
+        pending.push_back(right);
+        pending.push_back(left);
+    }
+
+    u64 chunk_pair_count = 0;
+
+    for (const auto& chunk : result.chunks) {
+        if (chunk.pair_count >
+            std::numeric_limits<u64>::max() - chunk_pair_count)
+        {
+            throw std::overflow_error(
+                "split partition pair-count overflow");
+        }
+
+        chunk_pair_count += chunk.pair_count;
+    }
+
+    if (chunk_pair_count != result.pair_count) {
+        throw std::runtime_error(
+            "split partition pair counts do not match parent");
+    }
+
+    return result;
+}
+
+static partition_search_result search_partition_chunks(
+    partition_search_function* search_backend_function,
+    const std::vector<search_partition>& chunks)
+{
+    partition_search_result result;
+
+    for (const auto& chunk : chunks) {
+        const auto search_start =
+            std::chrono::steady_clock::now();
+
+        auto chunk_collisions =
+            search_backend_function(chunk);
+
+        const auto search_end =
+            std::chrono::steady_clock::now();
+
+        result.elapsed_seconds +=
+            std::chrono::duration<double>(
+                search_end - search_start).count();
+
+        if (chunk_collisions.size() >
+            result.collisions.max_size() -
+                result.collisions.size())
+        {
+            throw std::length_error(
+                "combined partition collision result is too large");
+        }
+
+        result.collisions.insert(
+            result.collisions.end(),
+            chunk_collisions.begin(),
+            chunk_collisions.end());
+    }
+
+    return result;
 }
 
 std::vector<search_partition> make_partitions(
@@ -2570,7 +2730,7 @@ static int run_stage1(
             (unsigned long long)max_b);
 
         std::printf(
-            "Pair buffer target: %llu bytes (%llu records, %zu bytes each)\n",
+            "Pair buffer limit: %llu bytes (%llu records, %zu bytes each)\n",
             (unsigned long long)buffer_size_bytes,
             (unsigned long long)target_pair_records,
             pair_record_size);
@@ -2782,7 +2942,8 @@ static int run_stage1(
             else {
                 run_mpi_worker(
                     search_backend_function,
-                    mpi_rank);
+                    mpi_rank,
+                    target_pair_records);
             }
 
             check_mpi(
@@ -2957,42 +3118,74 @@ static int run_stage1(
                                             std::fflush(stdout);
                                         });
 
+                                const auto prepared =
+                                    split_partition_to_target(
+                                        partition,
+                                        target_pair_records);
+
                                 {
                                     std::lock_guard<std::mutex> lock(
                                         progress_mutex);
 
+                                    if (prepared.chunks.size() > 1) {
+                                        std::printf(
+                                            "Worker %zu/%zu split "
+                                            "partition %zu into %zu chunks "
+                                            "(largest=%llu pairs, "
+                                            "target=%llu).\n",
+                                            worker_index + 1,
+                                            worker_count,
+                                            partition_index + 1,
+                                            prepared.chunks.size(),
+                                            (unsigned long long)
+                                                prepared
+                                                    .largest_chunk_pair_count,
+                                            (unsigned long long)
+                                                target_pair_records);
+                                    }
+
+                                    if (prepared
+                                            .has_indivisible_oversized_chunk)
+                                    {
+                                        std::printf(
+                                            "Worker %zu/%zu warning: "
+                                            "partition %zu contains an "
+                                            "indivisible equal-sum group "
+                                            "larger than the pair-buffer "
+                                            "target.\n",
+                                            worker_index + 1,
+                                            worker_count,
+                                            partition_index + 1);
+                                    }
+
                                     std::printf(
                                         "Worker %zu/%zu processing "
                                         "partition %zu/%zu "
-                                        "(pair_count=%llu)...\n",
+                                        "(pair_count=%llu, chunks=%zu)...\n",
                                         worker_index + 1,
                                         worker_count,
                                         partition_index + 1,
                                         partitions.size(),
                                         (unsigned long long)
-                                            partition.pair_count);
+                                            prepared.pair_count,
+                                        prepared.chunks.size());
                                     std::fflush(stdout);
                                 }
 
-                                const auto search_start =
-                                    std::chrono::steady_clock::now();
+                                auto search_result =
+                                    search_partition_chunks(
+                                        search_backend_function,
+                                        prepared.chunks);
 
-                                auto collisions =
-                                    search_backend_function(
-                                        partition);
-
-                                const auto search_end =
-                                    std::chrono::steady_clock::now();
-
+                                auto& collisions =
+                                    search_result.collisions;
                                 const double elapsed_seconds =
-                                    std::chrono::duration<double>(
-                                        search_end - search_start)
-                                        .count();
+                                    search_result.elapsed_seconds;
 
                                 const double operations_per_second =
                                     elapsed_seconds > 0.0
                                         ? static_cast<double>(
-                                            partition.pair_count) /
+                                            prepared.pair_count) /
                                             elapsed_seconds
                                         : 0.0;
 

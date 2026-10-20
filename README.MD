@@ -122,7 +122,7 @@ magic-square-cubes-stage1 -p NAME [options]
   --project NAME       same as -p
   -a MIN:MAX           inclusive range for a
   -b MIN:MAX           inclusive range for b
-  -m SIZE              target pair-buffer size
+  -m SIZE              maximum pair-buffer size
   --buffer-size SIZE   same as -m
   -j N                 number of CPU worker threads
   --threads N          same as -j
@@ -252,19 +252,30 @@ The HIP MPI executable also contains the CPU backend and may be run with
 
 ## Partitioning and memory
 
-The pair-buffer size is a partitioning guideline, not a hard memory limit.
-Partitions are formed from half-open sum ranges:
+The pair-buffer size limits the pair records passed to one backend invocation.
+It applies separately to every active CPU worker or MPI worker rank; it is not
+an aggregate limit across workers. Partitions are formed from half-open sum
+ranges:
 
 ```text
 s_min <= a^3 + b^3 < s_max
 ```
 
-The program may allow a partition to exceed the target when it cannot be split
-without dividing an equal-sum group. On the CPU, the buffer target applies to
-each active worker. Startup samples the sum distribution to create partition
-boundaries. Exact bounds and pair counts are calculated when a worker receives
-a partition, allowing computation to begin without first analyzing every
-partition serially. MPI workers perform this preparation in parallel.
+Startup samples the sum distribution to create initial partition boundaries,
+so an initial partition's exact pair count may exceed the requested limit.
+When a worker calculates that exact count, it recursively splits an oversized
+sum interval before invoking the backend. Splitting at sum boundaries keeps
+all representations of an equal sum together. The only permitted exception is
+a single equal-sum group that is itself larger than the limit; the program
+prints a warning in that case. Deferring this preparation allows computation
+to begin without first analyzing every partition serially, and MPI workers
+perform it in parallel.
+
+`-m` is not a strict limit on all process or GPU memory. Span metadata,
+collision output, runtime allocations, and—for radix mode—sort output and
+temporary workspace are additional. It does prevent sampling error from
+making a normal hash-table partition substantially larger than its configured
+pair budget.
 
 With `--gpu-method hash`, the HIP backend performs these stages for every
 partition:
@@ -284,7 +295,9 @@ partition:
 The count pass determines the exact collision-buffer size; no maximum
 collision estimate is required. Hash-table partitioning budgets 20 bytes per
 input pair. The allocated table uses 12 bytes per slot and has approximately
-10 slots for every 7 pairs.
+10 slots for every 7 pairs. Consequently, the table itself normally occupies
+about 6/7 of the `-m` value, leaving the remainder for span metadata; collision
+output and HIP runtime overhead remain additional.
 
 With `--gpu-method radix`, the HIP backend performs these stages:
 
